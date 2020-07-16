@@ -1,6 +1,7 @@
 #include "taichi/ir/ir.h"
 #include "taichi/ir/analysis.h"
 #include "taichi/ir/visitors.h"
+
 #include <vector>
 #include <unordered_set>
 
@@ -35,8 +36,14 @@ class IRVerifier : public BasicStmtVisitor {
           break;
         }
       }
-      TI_ASSERT_INFO(found, "stmt {} cannot have operand {}.", stmt->id,
-                     op->id);
+      TI_ASSERT_INFO(
+          found,
+          "IR broken: stmt {} cannot have operand {}."
+          " Consider adding `ti.core.toggle_advance_optimization(False)`?"
+          " If that fixes the problem, please report this bug by opening an"
+          " issue at https://github.com/taichi-dev/taichi to help us improve,"
+          " many thanks!",
+          stmt->id, op->id);
     }
     visible_stmts.back().insert(stmt);
   }
@@ -95,6 +102,7 @@ class IRVerifier : public BasicStmtVisitor {
 
 namespace irpass::analysis {
 void verify(IRNode *root) {
+  TI_AUTO_PROF;
   IRVerifier::run(root);
 }
 }  // namespace irpass::analysis

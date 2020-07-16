@@ -1,7 +1,7 @@
 import taichi as ti
 import numpy as np
 
-ti.init(arch=ti.x64)
+ti.init(arch=ti.cpu)
 
 RES = 1024
 K = 2
@@ -18,6 +18,8 @@ B.place(qt)
 
 img = ti.Vector(3, dt=ti.f32, shape=(RES, RES))
 
+print('The quad tree layout is:\n', qt.snode())
+
 
 @ti.kernel
 def action(p: ti.ext_arr()):
@@ -27,7 +29,7 @@ def action(p: ti.ext_arr()):
 
 
 @ti.func
-def draw_rect(b, i, j, s, k, dx, dy):
+def draw_rect(b: ti.template(), i, j, s, k, dx, dy):
     x = i // s
     y = j // s
     a = 0
@@ -56,7 +58,7 @@ def vec2_npf32(m):
 
 
 gui = ti.GUI('Quadtree', (RES, RES))
-while not gui.get_event(ti.GUI.PRESS):
+while not gui.get_event(ti.GUI.ESCAPE, ti.GUI.EXIT):
     Broot.deactivate_all()
     pos = gui.get_cursor_pos()
     action(vec2_npf32(pos))

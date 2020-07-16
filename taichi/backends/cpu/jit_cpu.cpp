@@ -36,6 +36,7 @@
 #include "taichi/lang_util.h"
 #include "taichi/program/program.h"
 #include "taichi/jit/jit_session.h"
+#include "taichi/util/file_sequence_writer.h"
 
 TLANG_NAMESPACE_BEGIN
 
@@ -83,11 +84,17 @@ class JITSessionCPU : public JITSession {
                        memory_manager = smgr.get();
                        return smgr;
                      }),
-        compile_layer(ES, object_layer, ConcurrentIRCompiler(std::move(JTMB))),
+        compile_layer(ES,
+                      object_layer,
+                      std::make_unique<ConcurrentIRCompiler>(std::move(JTMB))),
         DL(DL),
         Mangle(ES, this->DL),
         module_counter(0),
         memory_manager(nullptr) {
+    if (JTMB.getTargetTriple().isOSBinFormatCOFF()) {
+      object_layer.setOverrideObjectFlagsWithResponsibilityFlags(true);
+      object_layer.setAutoClaimResponsibilityForObjectSymbols(true);
+    }
   }
 
   ~JITSessionCPU() {
@@ -105,8 +112,9 @@ class JITSessionCPU : public JITSession {
     global_optimize_module_cpu(M);
     std::lock_guard<std::mutex> _(mut);
     auto &dylib = ES.createJITDylib(fmt::format("{}", module_counter));
-    dylib.setGenerator(cantFail(
-        llvm::orc::DynamicLibrarySearchGenerator::GetForCurrentProcess(DL)));
+    dylib.addGenerator(
+        cantFail(llvm::orc::DynamicLibrarySearchGenerator::GetForCurrentProcess(
+            DL.getGlobalPrefix())));
     auto *thread_safe_context = get_current_program()
                                     .get_llvm_context(host_arch())
                                     ->get_this_thread_thread_safe_context();
@@ -122,7 +130,11 @@ class JITSessionCPU : public JITSession {
 
   void *lookup(const std::string Name) override {
     std::lock_guard<std::mutex> _(mut);
+#ifdef __APPLE__
     auto symbol = ES.lookup(all_libs, Mangle(Name));
+#else
+    auto symbol = ES.lookup(all_libs, ES.intern(Name));
+#endif
     if (!symbol)
       TI_ERROR("Function \"{}\" not found", Name);
     return (void *)(symbol->getAddress());
@@ -130,7 +142,11 @@ class JITSessionCPU : public JITSession {
 
   void *lookup_in_module(JITDylib *lib, const std::string Name) {
     std::lock_guard<std::mutex> _(mut);
+#ifdef __APPLE__
     auto symbol = ES.lookup({lib}, Mangle(Name));
+#else
+    auto symbol = ES.lookup({lib}, ES.intern(Name));
+#endif
     if (!symbol)
       TI_ERROR("Function \"{}\" not found", Name);
     return (void *)(symbol->getAddress());
@@ -333,15 +349,14 @@ void JITSessionCPU::global_optimize_module_cpu(
   }
 
   if (get_current_program().config.print_kernel_llvm_ir_optimized) {
-    TI_INFO("Functions with > 100 instructions in optimized LLVM IR:");
-    static int counter = 0;
-    std::error_code ec;
-    auto fn = fmt::format("taichi_optimized_{:04d}.ll", counter);
-    llvm::raw_fd_ostream fdos(fn, ec);
-    module->print(fdos, nullptr);
-    TaichiLLVMContext::print_huge_functions(module.get());
-    TI_INFO("Optimized LLVM IR emitted to file {}", fn);
-    counter++;
+    if (false) {
+      TI_INFO("Functions with > 100 instructions in optimized LLVM IR:");
+      TaichiLLVMContext::print_huge_functions(module.get());
+    }
+    static FileSequenceWriter writer(
+        "taichi_kernel_cpu_llvm_ir_optimized_{:04d}.ll",
+        "optimized LLVM IR (CPU)");
+    writer.write(module.get());
   }
 }
 

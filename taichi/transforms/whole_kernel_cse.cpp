@@ -2,20 +2,58 @@
 #include "taichi/ir/transforms.h"
 #include "taichi/ir/analysis.h"
 #include "taichi/ir/visitors.h"
+#include <typeindex>
 
 TLANG_NAMESPACE_BEGIN
+
+// A helper class to maintain WholeKernelCSE::visited
+class MarkUndone : public BasicStmtVisitor {
+ private:
+  std::unordered_set<int> *const visited;
+  Stmt *const modified_operand;
+
+ public:
+  using BasicStmtVisitor::visit;
+
+  MarkUndone(std::unordered_set<int> *visited, Stmt *modified_operand)
+      : visited(visited), modified_operand(modified_operand) {
+    allow_undefined_visitor = true;
+    invoke_default_visitor = true;
+  }
+
+  void visit(Stmt *stmt) override {
+    if (stmt->has_operand(modified_operand)) {
+      visited->erase(stmt->instance_id);
+    }
+  }
+
+  void preprocess_container_stmt(Stmt *stmt) override {
+    if (stmt->has_operand(modified_operand)) {
+      visited->erase(stmt->instance_id);
+    }
+  }
+
+  static void run(std::unordered_set<int> *visited, Stmt *modified_operand) {
+    MarkUndone marker(visited, modified_operand);
+    modified_operand->get_ir_root()->accept(&marker);
+  }
+};
 
 // Whole Kernel Common Subexpression Elimination
 class WholeKernelCSE : public BasicStmtVisitor {
  private:
   std::unordered_set<int> visited;
   // each scope corresponds to an unordered_set
-  std::vector<std::unordered_set<Stmt *>> visible_stmts;
+  std::vector<std::unordered_map<std::type_index, std::unordered_set<Stmt *>>>
+      visible_stmts;
+  DelayedIRModifier modifier;
 
  public:
   using BasicStmtVisitor::visit;
 
   WholeKernelCSE() {
+    allow_undefined_visitor = true;
+    invoke_default_visitor = true;
   }
 
   bool is_done(Stmt *stmt) {
@@ -26,25 +64,37 @@ class WholeKernelCSE : public BasicStmtVisitor {
     visited.insert(stmt->instance_id);
   }
 
+  static bool common_statement_eliminable(Stmt *this_stmt, Stmt *prev_stmt) {
+    // Is this_stmt eliminable given that prev_stmt appears before it and has
+    // the same type with it?
+    if (this_stmt->is<GlobalPtrStmt>()) {
+      auto this_ptr = this_stmt->as<GlobalPtrStmt>();
+      auto prev_ptr = prev_stmt->as<GlobalPtrStmt>();
+      return irpass::analysis::definitely_same_address(this_ptr, prev_ptr) &&
+             (this_ptr->activate == prev_ptr->activate || prev_ptr->activate);
+    }
+    return irpass::analysis::same_statements(this_stmt, prev_stmt);
+  }
+
   void visit(Stmt *stmt) override {
-    if (stmt->has_global_side_effect())
+    if (!stmt->common_statement_eliminable())
       return;
-    // Generic visitor for all non-container statements that don't have global
-    // side effect.
+    // Generic visitor for all CSE-able statements.
     if (is_done(stmt)) {
-      visible_stmts.back().insert(stmt);
+      visible_stmts.back()[std::type_index(typeid(*stmt))].insert(stmt);
       return;
     }
     for (auto &scope : visible_stmts) {
-      for (auto &prev_stmt : scope) {
-        if (irpass::analysis::same_statements(stmt, prev_stmt)) {
+      for (auto &prev_stmt : scope[std::type_index(typeid(*stmt))]) {
+        if (common_statement_eliminable(stmt, prev_stmt)) {
+          MarkUndone::run(&visited, stmt);
           stmt->replace_with(prev_stmt);
-          stmt->parent->erase(stmt);
-          throw IRModified();
+          modifier.erase(stmt);
+          return;
         }
       }
     }
-    visible_stmts.back().insert(stmt);
+    visible_stmts.back()[std::type_index(typeid(*stmt))].insert(stmt);
     set_done(stmt);
   }
 
@@ -60,14 +110,12 @@ class WholeKernelCSE : public BasicStmtVisitor {
     if (if_stmt->true_statements) {
       if (if_stmt->true_statements->statements.empty()) {
         if_stmt->true_statements = nullptr;
-        throw IRModified();
       }
     }
 
     if (if_stmt->false_statements) {
       if (if_stmt->false_statements->statements.empty()) {
         if_stmt->false_statements = nullptr;
-        throw IRModified();
       }
     }
 
@@ -79,24 +127,26 @@ class WholeKernelCSE : public BasicStmtVisitor {
       if (irpass::analysis::same_statements(
               true_clause->statements[0].get(),
               false_clause->statements[0].get())) {
+        // Directly modify this because it won't invalidate any iterators.
         auto common_stmt = true_clause->extract(0);
         irpass::replace_all_usages_with(false_clause.get(),
                                         false_clause->statements[0].get(),
                                         common_stmt.get());
-        if_stmt->insert_before_me(std::move(common_stmt));
+        modifier.insert_before(if_stmt, std::move(common_stmt));
         false_clause->erase(0);
-        throw IRModified();
       }
-      if (irpass::analysis::same_statements(
+      if (!true_clause->statements.empty() &&
+          !false_clause->statements.empty() &&
+          irpass::analysis::same_statements(
               true_clause->statements.back().get(),
               false_clause->statements.back().get())) {
+        // Directly modify this because it won't invalidate any iterators.
         auto common_stmt = true_clause->extract((int)true_clause->size() - 1);
         irpass::replace_all_usages_with(false_clause.get(),
                                         false_clause->statements.back().get(),
                                         common_stmt.get());
-        if_stmt->insert_before_me(std::move(common_stmt));
+        modifier.insert_after(if_stmt, std::move(common_stmt));
         false_clause->erase((int)false_clause->size() - 1);
-        throw IRModified();
       }
     }
 
@@ -106,27 +156,25 @@ class WholeKernelCSE : public BasicStmtVisitor {
       if_stmt->false_statements->accept(this);
   }
 
-  static void run(IRNode *node) {
+  static bool run(IRNode *node) {
     WholeKernelCSE eliminator;
+    bool modified = false;
     while (true) {
-      bool modified = false;
-      try {
-        node->accept(&eliminator);
-      } catch (IRModified) {
+      node->accept(&eliminator);
+      if (eliminator.modifier.modify_ir())
         modified = true;
-      }
-      if (!modified)
+      else
         break;
     }
+    return modified;
   }
 };
 
 namespace irpass {
-
-void whole_kernel_cse(IRNode *root) {
-  WholeKernelCSE::run(root);
+bool whole_kernel_cse(IRNode *root) {
+  TI_AUTO_PROF;
+  return WholeKernelCSE::run(root);
 }
-
 }  // namespace irpass
 
 TLANG_NAMESPACE_END

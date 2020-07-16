@@ -1,6 +1,8 @@
 import taichi as ti
 import numpy as np
 from taichi import approx
+import pytest
+import math
 
 
 @ti.all_archs
@@ -26,39 +28,65 @@ def test_const_init():
 @ti.all_archs
 def test_basic_utils():
     a = ti.Vector(3, dt=ti.f32)
-    b = ti.Vector(3, dt=ti.f32)
-    abT = ti.Matrix(3, 3, dt=ti.f32)
+    b = ti.Vector(2, dt=ti.f32)
+    abT = ti.Matrix(3, 2, dt=ti.f32)
     aNormalized = ti.Vector(3, dt=ti.f32)
 
     normA = ti.var(ti.f32)
     normSqrA = ti.var(ti.f32)
+    normInvA = ti.var(ti.f32)
 
-    ti.root.place(a, b, abT, aNormalized, normA, normSqrA)
+    ti.root.place(a, b, abT, aNormalized, normA, normSqrA, normInvA)
 
     @ti.kernel
     def init():
         a[None] = ti.Vector([1.0, 2.0, 3.0])
-        b[None] = ti.Vector([4.0, 5.0, 6.0])
-        abT[None] = a.outer_product(b)
+        b[None] = ti.Vector([4.0, 5.0])
+        abT[None] = a[None].outer_product(b[None])
 
-        normA[None] = a.norm()
-        normSqrA[None] = a.norm_sqr()
+        normA[None] = a[None].norm()
+        normSqrA[None] = a[None].norm_sqr()
+        normInvA[None] = a[None].norm_inv()
 
-        aNormalized[None] = a.normalized()
+        aNormalized[None] = a[None].normalized()
 
     init()
 
     for i in range(3):
-        for j in range(3):
+        for j in range(2):
             assert abT[None][i, j] == a[None][i] * b[None][j]
 
     sqrt14 = np.sqrt(14.0)
     invSqrt14 = 1.0 / sqrt14
-    assert normSqrA[None] == 14.0
+    assert normSqrA[None] == approx(14.0)
+    assert normInvA[None] == approx(invSqrt14)
     assert normA[None] == approx(sqrt14)
     assert aNormalized[None][0] == approx(1.0 * invSqrt14)
     assert aNormalized[None][1] == approx(2.0 * invSqrt14)
     assert aNormalized[None][2] == approx(3.0 * invSqrt14)
+
+
+@ti.all_archs
+def test_matrix_ssa():
+    a = ti.Vector(2, ti.f32, ())
+    b = ti.Matrix(2, 2, ti.f32, ())
+    c = ti.Vector(2, ti.f32, ())
+
+    @ti.kernel
+    def func():
+        a[None] = a[None].normalized()
+        b[None] = b[None].transpose()
+        c[None] = ti.Vector([c[None][1], c[None][0]])
+
+    inv_sqrt2 = 1 / math.sqrt(2)
+
+    a[None] = [1, 1]
+    b[None] = [[1, 2], [3, 4]]
+    c[None] = [2, 3]
+    func()
+    assert a[None].value == ti.Vector([inv_sqrt2, inv_sqrt2])
+    assert b[None].value == ti.Matrix([[1, 3], [2, 4]])
+    assert c[None].value == ti.Vector([3, 2])
 
 
 @ti.all_archs
@@ -77,11 +105,11 @@ def test_cross():
     def init():
         a[None] = ti.Vector([1.0, 2.0, 3.0])
         b[None] = ti.Vector([4.0, 5.0, 6.0])
-        c[None] = a.cross(b)
+        c[None] = a[None].cross(b[None])
 
         a2[None] = ti.Vector([1.0, 2.0])
         b2[None] = ti.Vector([4.0, 5.0])
-        c2[None] = a2.cross(b2)
+        c2[None] = a2[None].cross(b2[None])
 
     init()
     assert c[None][0] == -3.0
@@ -238,11 +266,17 @@ def test_mat_inverse():
 
 
 @ti.all_archs
-def test_unit_vectors():
-    a = ti.Vector(3, dt=ti.i32, shape=3)
+def test_matrix_factories():
+    a = ti.Vector.var(3, dt=ti.i32, shape=3)
+    b = ti.Matrix.var(2, 2, dt=ti.f32, shape=2)
+    c = ti.Matrix.var(2, 3, dt=ti.f32, shape=2)
 
     @ti.kernel
     def fill():
+        b[0] = ti.Matrix.identity(ti.f32, 2)
+        b[1] = ti.Matrix.rotation2d(math.pi / 3)
+        c[0] = ti.Matrix.zero(ti.f32, 2, 3)
+        c[1] = ti.Matrix.one(ti.f32, 2, 3)
         for i in ti.static(range(3)):
             a[i] = ti.Vector.unit(3, i)
 
@@ -252,12 +286,51 @@ def test_unit_vectors():
         for j in range(3):
             assert a[i][j] == int(i == j)
 
+    sqrt3o2 = math.sqrt(3) / 2
+    assert b[0].value.to_numpy() == approx(np.eye(2))
+    assert b[1].value.to_numpy() == approx(
+        np.array([[0.5, -sqrt3o2], [sqrt3o2, 0.5]]))
+    assert c[0].value.to_numpy() == approx(np.zeros((2, 3)))
+    assert c[1].value.to_numpy() == approx(np.ones((2, 3)))
+
 
 # TODO: move codes below to test_matrix.py:
 
 
 @ti.all_archs
 def test_init_matrix_from_vectors():
+    m1 = ti.Matrix(3, 3, dt=ti.f32, shape=(3))
+    m2 = ti.Matrix(3, 3, dt=ti.f32, shape=(3))
+    m3 = ti.Matrix(3, 3, dt=ti.f32, shape=(3))
+    m4 = ti.Matrix(3, 3, dt=ti.f32, shape=(3))
+
+    @ti.kernel
+    def fill():
+        for i in range(3):
+            a = ti.Vector([1.0, 4.0, 7.0])
+            b = ti.Vector([2.0, 5.0, 8.0])
+            c = ti.Vector([3.0, 6.0, 9.0])
+            m1[i] = ti.Matrix.rows([a, b, c])
+            m2[i] = ti.Matrix.cols([a, b, c])
+            m3[i] = ti.Matrix.rows([[1.0, 4.0, 7.0], [2.0, 5.0, 8.0],
+                                    [3.0, 6.0, 9.0]])
+            m4[i] = ti.Matrix.cols([[1.0, 4.0, 7.0], [2.0, 5.0, 8.0],
+                                    [3.0, 6.0, 9.0]])
+
+    fill()
+
+    for j in range(3):
+        for i in range(3):
+            assert m1[0][i, j] == int(i + 3 * j + 1)
+            assert m2[0][j, i] == int(i + 3 * j + 1)
+            assert m3[0][i, j] == int(i + 3 * j + 1)
+            assert m4[0][j, i] == int(i + 3 * j + 1)
+
+
+# TODO: Remove this once the apis are fully deprecated in incoming version.
+@pytest.mark.filterwarnings('ignore')
+@ti.host_arch_only
+def test_init_matrix_from_vectors_deprecated():
     m1 = ti.Matrix(3, 3, dt=ti.f32, shape=(3))
     m2 = ti.Matrix(3, 3, dt=ti.f32, shape=(3))
     m3 = ti.Matrix(3, 3, dt=ti.f32, shape=(3))
@@ -284,6 +357,16 @@ def test_init_matrix_from_vectors():
             assert m2[0][j, i] == int(i + 3 * j + 1)
             assert m3[0][i, j] == int(i + 3 * j + 1)
             assert m4[0][j, i] == int(i + 3 * j + 1)
+
+
+@pytest.mark.filterwarnings('ignore')
+@ti.host_arch_only
+def test_to_numpy_as_vector_deprecated():
+    v = ti.Vector(3, dt=ti.f32, shape=(2))
+    u = np.array([[2, 3, 4], [5, 6, 7]])
+    v.from_numpy(u)
+    assert v.to_numpy(as_vector=True) == approx(u)
+    assert v.to_numpy() == approx(u)
 
 
 @ti.all_archs
@@ -316,6 +399,29 @@ def test_any_all():
                 assert c[None] == 0
 
 
+@ti.all_archs
+def test_min_max():
+    a = ti.Matrix(2, 2, dt=ti.i32, shape=())
+    b = ti.var(dt=ti.i32, shape=())
+    c = ti.var(dt=ti.i32, shape=())
+
+    @ti.kernel
+    def func():
+        b[None] = a[None].max()
+        c[None] = a[None].min()
+
+    for i in range(2):
+        for j in range(2):
+            a[None][0, 0] = i
+            a[None][1, 0] = j
+            a[None][1, 1] = i
+            a[None][0, 1] = j
+
+            func()
+            assert b[None] == max(i, j)
+            assert c[None] == min(i, j)
+
+
 # must not throw any error:
 @ti.all_archs
 def test_matrix_list_assign():
@@ -339,3 +445,44 @@ def test_matrix_list_assign():
     func()
     assert np.allclose(m.to_numpy()[1, 0, 0, :, :], np.array([[2, 4], [6, 8]]))
     assert np.allclose(v.to_numpy()[1, 0, 0, :], np.array([10, 12]))
+
+
+@ti.host_arch_only
+def test_vector_xyzw_accessor():
+    u = ti.Vector(2, dt=ti.i32, shape=(2, 2, 1))
+    v = ti.Vector(4, dt=ti.i32, shape=(2, 2, 1))
+
+    u[1, 0, 0].y = 3
+    v[1, 0, 0].z = 0
+    v[1, 0, 0].w = 4
+
+    @ti.kernel
+    def func():
+        u[1, 0, 0].x = 8 * u[1, 0, 0].y
+        v[1, 0, 0].z = 1 - v[1, 0, 0].w
+        v[1, 0, 0].x = 6
+
+    func()
+    assert u[1, 0, 0].x == 24
+    assert u[1, 0, 0].y == 3
+    assert v[1, 0, 0].z == -3
+    assert v[1, 0, 0].w == 4
+    assert np.allclose(v.to_numpy()[1, 0, 0, :], np.array([6, 0, -3, 4]))
+
+
+@ti.host_arch_only
+def test_diag():
+    m1 = ti.Matrix(3, 3, dt=ti.f32, shape=())
+
+    @ti.kernel
+    def fill():
+        m1[None] = ti.Matrix.diag(dim=3, val=1.4)
+
+    fill()
+
+    for i in range(3):
+        for j in range(3):
+            if i == j:
+                assert m1[None][i, j] == approx(1.4)
+            else:
+                assert m1[None][i, j] == 0.0

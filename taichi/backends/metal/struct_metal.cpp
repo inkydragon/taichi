@@ -26,8 +26,7 @@ namespace shaders {
 
 }  // namespace shaders
 
-constexpr size_t kListgenElementSize = sizeof(shaders::ListgenElement);
-constexpr size_t kListManagerSize = sizeof(shaders::ListManager);
+constexpr size_t kListManagerDataSize = sizeof(shaders::ListManagerData);
 constexpr size_t kSNodeMetaSize = sizeof(shaders::SNodeMeta);
 constexpr size_t kSNodeExtractorsSize = sizeof(shaders::SNodeExtractors);
 
@@ -69,15 +68,15 @@ class StructCompiler {
       ++max_snodes_;
     }
 
+    CompiledStructs result;
+    result.root_size = compute_snode_size(&root);
+    emit_runtime_structs();
+    line_appender_.dump(&result.runtime_utils_source_code);
+    result.runtime_size = compute_runtime_size();
     for (auto &n : snodes_rev) {
       generate_types(*n);
     }
-    CompiledStructs result;
-    result.root_size = compute_snode_size(&root);
     line_appender_.dump(&result.snode_structs_source_code);
-    emit_runtime_structs(&root);
-    line_appender_.dump(&result.runtime_utils_source_code);
-    result.runtime_size = compute_runtime_size();
     result.need_snode_lists_data = has_sparse_snode_;
     result.max_snodes = max_snodes_;
     result.snode_descriptors = std::move(snode_descriptors_);
@@ -98,34 +97,27 @@ class StructCompiler {
   void generate_types(const SNode &snode) {
     const bool is_place = snode.is_place();
     if (!is_place) {
+      // Generate {snode}_ch
       const std::string class_name = snode.node_type_name + "_ch";
       emit("class {} {{", class_name);
       emit(" public:");
-      emit("  {}(device byte* a) : addr_(a) {{}}", class_name);
+      emit("  {}(device byte *a) : addr_(a) {{}}", class_name);
 
-      std::string stride_str;
+      std::string stride_str = "0";
       for (int i = 0; i < (int)snode.ch.size(); i++) {
         const auto &ch_node_name = snode.ch[i]->node_type_name;
         emit("  {} get{}() {{", ch_node_name, i);
-        if (stride_str.empty()) {
-          emit("    return {{addr_}};");
-          stride_str = ch_node_name + "::stride";
-        } else {
-          emit("    return {{addr_ + ({})}};", stride_str);
-          stride_str += " + " + ch_node_name + "::stride";
-        }
+        emit("    return {{addr_ + ({})}};", stride_str);
+        stride_str += " + " + ch_node_name + "::stride";
         emit("  }}");
         emit("");
       }
-      emit("  device byte* addr() {{ return addr_; }}");
+      emit("  device byte *addr() {{ return addr_; }}");
       emit("");
-      if (stride_str.empty()) {
-        // Is it possible for this to have no children?
-        stride_str = "0";
-      }
+      // Is it possible for this to have no children?
       emit("  constant static constexpr int stride = {};", stride_str);
       emit(" private:");
-      emit("  device byte* addr_;");
+      emit("  device byte *addr_;");
       emit("}};");
     }
     emit("");
@@ -213,37 +205,23 @@ class StructCompiler {
     return sn_desc.stride;
   }
 
-  void emit_runtime_structs(const SNode *root) {
+  void emit_runtime_structs() {
     line_appender_.append_raw(shaders::kMetalRuntimeStructsSourceCode);
-    emit("");
-    line_appender_.append_raw(shaders::kMetalRuntimeUtilsSourceCode);
     emit("");
     emit("struct Runtime {{");
     emit("  SNodeMeta snode_metas[{}];", max_snodes_);
     emit("  SNodeExtractors snode_extractors[{}];", max_snodes_);
-    emit("  ListManager snode_lists[{}];", max_snodes_);
+    emit("  ListManagerData snode_lists[{}];", max_snodes_);
     emit("  uint32_t rand_seeds[{}];", kNumRandSeeds);
     emit("}};");
+    line_appender_.append_raw(shaders::kMetalRuntimeUtilsSourceCode);
+    emit("");
   }
 
   size_t compute_runtime_size() {
-    size_t result = (max_snodes_) *
-                    (kSNodeMetaSize + kSNodeExtractorsSize + kListManagerSize);
+    size_t result = (max_snodes_) * (kSNodeMetaSize + kSNodeExtractorsSize +
+                                     kListManagerDataSize);
     result += sizeof(uint32_t) * kNumRandSeeds;
-    TI_DEBUG("Metal sizeof(Runtime): {} bytes", result);
-    if (has_sparse_snode_) {
-      // We only need additional memory to hold sparsity information. Don't
-      // allocate it if there is no sparse SNode at all.
-      int total_items = 0;
-      for (const auto &kv : snode_descriptors_) {
-        total_items += kv.second.total_num_self_from_root(snode_descriptors_);
-      }
-      const size_t list_data_size = total_items * kListgenElementSize;
-      TI_DEBUG("Metal runtime sparse list data size: {} bytes", list_data_size);
-      result += list_data_size;
-    } else {
-      TI_TRACE("Metal runtime doesn't need additional memory for snode_lists");
-    }
     return result;
   }
 
@@ -269,6 +247,10 @@ int SNodeDescriptor::total_num_self_from_root(
   const auto *psn = snode->parent;
   TI_ASSERT(psn != nullptr);
   return sn_descs.find(psn->id)->second.total_num_elems_from_root;
+}
+
+int total_num_self_from_root(const SNodeDescriptorsMap &m, int snode_id) {
+  return m.at(snode_id).total_num_self_from_root(m);
 }
 
 CompiledStructs compile_structs(SNode &root) {

@@ -36,7 +36,6 @@ class TypeCheck : public IRVisitor {
     // visiting order, at compile time.
 
     // ret_type stands for its element type.
-    stmt->ret_type.set_is_pointer(false);
   }
 
   void visit(IfStmt *if_stmt) {
@@ -78,7 +77,6 @@ class TypeCheck : public IRVisitor {
     TI_ASSERT(stmt->width() == 1);
     auto lookup = stmt->ptr[0].var->ret_type;
     stmt->ret_type = lookup;
-    stmt->ret_type.set_is_pointer(false);
   }
 
   void visit(LocalStoreStmt *stmt) {
@@ -88,19 +86,20 @@ class TypeCheck : public IRVisitor {
     }
     auto common_container_type = promoted_type(stmt->ptr->ret_type.data_type,
                                                stmt->data->ret_type.data_type);
+
+    auto old_data = stmt->data;
     if (stmt->ptr->ret_type.data_type != stmt->data->ret_type.data_type) {
       stmt->data = insert_type_cast_before(stmt, stmt->data,
                                            stmt->ptr->ret_type.data_type);
     }
     if (stmt->ptr->ret_type.data_type != common_container_type) {
       TI_WARN(
-          "[{}] Local store may lose precision (target = {}, value = {}, at",
+          "[{}] Local store may lose precision (target = {}, value = {}) at",
           stmt->name(), stmt->ptr->ret_data_type_name(),
-          stmt->data->ret_data_type_name(), stmt->id);
-      fmt::print(stmt->tb);
+          old_data->ret_data_type_name(), stmt->id);
+      TI_WARN("\n{}", stmt->tb);
     }
     stmt->ret_type = stmt->ptr->ret_type;
-    stmt->ret_type.set_is_pointer(false);
   }
 
   void visit(GlobalLoadStmt *stmt) {
@@ -128,13 +127,13 @@ class TypeCheck : public IRVisitor {
       }
     }
     for (int i = 0; i < stmt->indices.size(); i++) {
-      TI_ASSERT_INFO(
-          is_integral(stmt->indices[i]->ret_type.data_type),
-          "[{}] Taichi tensors must be accessed with integral indices (e.g., "
-          "i32/i64). It seems that you have used a float point number as "
-          "an index. You can cast that to an integer using int(). Also note "
-          "that ti.floor(ti.f32) returns f32.",
-          stmt->name());
+      if (!is_integral(stmt->indices[i]->ret_type.data_type)) {
+        TI_WARN(
+            "[{}] Tensor index {} not integral, casting into int32 implicitly",
+            stmt->name(), i);
+        stmt->indices[i] =
+            insert_type_cast_before(stmt, stmt->indices[i], DataType::i32);
+      }
       TI_ASSERT(stmt->indices[i]->ret_type.width == stmt->snodes.size());
     }
   }
@@ -149,8 +148,8 @@ class TypeCheck : public IRVisitor {
     }
     if (stmt->ptr->ret_type.data_type != promoted) {
       TI_WARN("[{}] Global store may lose precision: {} <- {}, at",
-              stmt->name(), stmt->ptr->ret_data_type_name(), input_type,
-              stmt->tb);
+              stmt->name(), stmt->ptr->ret_data_type_name(), input_type);
+      TI_WARN("\n{}", stmt->tb);
     }
     stmt->ret_type = stmt->ptr->ret_type;
   }
@@ -174,16 +173,19 @@ class TypeCheck : public IRVisitor {
     if (stmt->is_cast()) {
       stmt->ret_type.data_type = stmt->cast_type;
     }
-    if (is_trigonometric(stmt->op_type) &&
-        !is_real(stmt->operand->ret_type.data_type)) {
-      TI_ERROR("[{}] Trigonometric operator takes real inputs only. At {}",
-               stmt->name(), stmt->tb);
-    }
-    if ((stmt->op_type == UnaryOpType::floor ||
-         stmt->op_type == UnaryOpType::ceil) &&
-        !is_real(stmt->operand->ret_type.data_type)) {
-      TI_ERROR("[{}] floor/ceil takes real inputs only. At {}", stmt->name(),
-               stmt->tb);
+    if (!is_real(stmt->operand->ret_type.data_type)) {
+      if (is_trigonometric(stmt->op_type)) {
+        TI_ERROR("[{}] Trigonometric operator takes real inputs only. At {}",
+                 stmt->name(), stmt->tb);
+      } else if (stmt->op_type == UnaryOpType::floor ||
+                 stmt->op_type == UnaryOpType::ceil) {
+        TI_ERROR("[{}] floor/ceil takes real inputs only. At {}", stmt->name(),
+                 stmt->tb);
+      } else if (stmt->op_type == UnaryOpType::sqrt ||
+                 stmt->op_type == UnaryOpType::exp ||
+                 stmt->op_type == UnaryOpType::log) {
+        cast(stmt->operand, config.default_fp);
+      }
     }
   }
 
@@ -227,7 +229,7 @@ class TypeCheck : public IRVisitor {
       } else {
         TI_WARN("[{}] {} at", stmt->name(), comment);
       }
-      fmt::print(stmt->tb);
+      TI_WARN("\n{}", stmt->tb);
       TI_WARN("Compilation stopped due to type mismatch.");
       throw std::runtime_error("Binary operator type mismatch");
     };
@@ -319,6 +321,7 @@ class TypeCheck : public IRVisitor {
     if (current_kernel == nullptr) {
       current_kernel = stmt->get_kernel();
     }
+    TI_ASSERT(current_kernel != nullptr);
     auto &args = current_kernel->args;
     TI_ASSERT(0 <= stmt->arg_id && stmt->arg_id < args.size());
     stmt->ret_type = VectorType(1, args[stmt->arg_id].dt);
@@ -347,6 +350,18 @@ class TypeCheck : public IRVisitor {
     stmt->ret_type = VectorType(1, DataType::i32);
   }
 
+  void visit(LoopLinearIndexStmt *stmt) {
+    stmt->ret_type = VectorType(1, DataType::i32);
+  }
+
+  void visit(BlockCornerIndexStmt *stmt) {
+    stmt->ret_type = VectorType(1, DataType::i32);
+  }
+
+  void visit(BlockDimStmt *stmt) {
+    stmt->ret_type = VectorType(1, DataType::i32);
+  }
+
   void visit(GetRootStmt *stmt) {
     stmt->ret_type = VectorType(1, DataType::gen, true);
   }
@@ -361,12 +376,11 @@ class TypeCheck : public IRVisitor {
   }
 
   void visit(OffloadedStmt *stmt) {
-    if (stmt->body)
-      stmt->body->accept(this);
+    stmt->all_blocks_accept(this);
   }
 
-  void visit(OffsetAndExtractBitsStmt *stmt) {
-    stmt->ret_type.data_type = DataType::i32;
+  void visit(BitExtractStmt *stmt) {
+    stmt->ret_type = stmt->input->ret_type;
   }
 
   void visit(LinearizeStmt *stmt) {
@@ -418,6 +432,7 @@ class TypeCheck : public IRVisitor {
 namespace irpass {
 
 void typecheck(IRNode *root) {
+  TI_AUTO_PROF;
   analysis::check_fields_registered(root);
   TypeCheck inst(root);
   root->accept(&inst);

@@ -23,6 +23,7 @@ class OffloadedTask {
 
   int block_dim;
   int grid_dim;
+  std::size_t shmem_bytes{0};
 
   OffloadedTask(CodeGenLLVM *codegen);
 
@@ -60,6 +61,8 @@ class CodeGenLLVM : public IRVisitor, public LLVMModuleBuilder {
   llvm::Type *context_ty;
   llvm::Type *physical_coordinate_ty;
   llvm::Value *current_coordinates;
+  llvm::Value *parent_coordinates{nullptr};
+  llvm::GlobalVariable *bls_buffer{nullptr};
   // Mainly for supporting continue stmt
   llvm::BasicBlock *current_loop_reentry;
   // Mainly for supporting break stmt
@@ -67,6 +70,7 @@ class CodeGenLLVM : public IRVisitor, public LLVMModuleBuilder {
   llvm::FunctionType *task_function_type;
   std::unordered_map<Stmt *, llvm::Value *> llvm_val;
   llvm::Function *func;
+  OffloadedStmt *current_offload{nullptr};
   std::unique_ptr<OffloadedTask> current_task;
   std::vector<OffloadedTask> offloaded_tasks;
   BasicBlock *func_body_bb;
@@ -88,6 +92,14 @@ class CodeGenLLVM : public IRVisitor, public LLVMModuleBuilder {
 
   llvm::Value *get_context();
 
+  llvm::Value *get_tls_base_ptr();
+
+  llvm::Type *get_tls_buffer_type();
+
+  std::vector<llvm::Type *> get_xlogue_argument_types();
+
+  llvm::Type *get_xlogue_function_type();
+
   llvm::Value *get_root();
 
   llvm::Value *get_runtime();
@@ -101,6 +113,8 @@ class CodeGenLLVM : public IRVisitor, public LLVMModuleBuilder {
   llvm::Value *emit_struct_meta(SNode *snode);
 
   virtual void emit_to_module();
+
+  void eliminate_unused_functions();
 
   virtual FunctionType compile_module_to_executable();
 
@@ -189,7 +203,7 @@ class CodeGenLLVM : public IRVisitor, public LLVMModuleBuilder {
 
   void visit(GetRootStmt *stmt) override;
 
-  void visit(OffsetAndExtractBitsStmt *stmt) override;
+  void visit(BitExtractStmt *stmt) override;
 
   void visit(LinearizeStmt *stmt) override;
 
@@ -222,7 +236,17 @@ class CodeGenLLVM : public IRVisitor, public LLVMModuleBuilder {
 
   void visit(LoopIndexStmt *stmt) override;
 
+  void visit(LoopLinearIndexStmt *stmt) override;
+
+  void visit(BlockCornerIndexStmt *stmt) override;
+
+  void visit(BlockDimStmt *stmt) override;
+
   void visit(GlobalTemporaryStmt *stmt) override;
+
+  void visit(ThreadLocalPtrStmt *stmt) override;
+
+  void visit(BlockLocalPtrStmt *stmt) override;
 
   void visit(InternalFuncStmt *stmt) override;
 
@@ -239,6 +263,10 @@ class CodeGenLLVM : public IRVisitor, public LLVMModuleBuilder {
   void visit(StackLoadTopAdjStmt *stmt) override;
 
   void visit(StackAccAdjointStmt *stmt) override;
+
+  void visit(RangeAssumptionStmt *stmt) override;
+
+  llvm::Value *create_xlogue(std::unique_ptr<Block> &block);
 
   ~CodeGenLLVM() = default;
 };

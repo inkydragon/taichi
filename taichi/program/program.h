@@ -14,8 +14,9 @@
 #include "taichi/backends/metal/kernel_manager.h"
 #include "taichi/backends/opengl/opengl_kernel_launcher.h"
 #include "taichi/backends/opengl/opengl_kernel_util.h"
+#include "taichi/backends/cc/cc_program.h"
 #include "taichi/program/kernel.h"
-#include "taichi/program/profiler.h"
+#include "taichi/program/kernel_profiler.h"
 #include "taichi/runtime/llvm/context.h"
 #include "taichi/runtime/runtime.h"
 #include "taichi/backends/metal/struct_metal.h"
@@ -99,7 +100,7 @@ class Program {
 
   std::vector<std::unique_ptr<Kernel>> kernels;
 
-  std::unique_ptr<ProfilerBase> profiler;
+  std::unique_ptr<KernelProfilerBase> profiler;
 
   std::unordered_map<JITEvaluatorId, std::unique_ptr<Kernel>>
       jit_evaluator_cache;
@@ -110,11 +111,11 @@ class Program {
 
   Program(Arch arch);
 
-  void profiler_print() {
+  void kernel_profiler_print() {
     profiler->print();
   }
 
-  void profiler_clear() {
+  void kernel_profiler_clear() {
     profiler->clear();
   }
 
@@ -126,7 +127,7 @@ class Program {
     profiler->stop();
   }
 
-  ProfilerBase *get_profiler() {
+  KernelProfilerBase *get_profiler() {
     return profiler.get();
   }
 
@@ -236,6 +237,8 @@ class Program {
 
   void launch_async(Kernel *kernel);
 
+  int default_block_dim() const;
+
   ~Program();
 
  private:
@@ -245,6 +248,12 @@ class Program {
   // OpenGL related data structures
   std::optional<opengl::StructCompiledResult> opengl_struct_compiled_;
   std::unique_ptr<opengl::GLSLLauncher> opengl_kernel_launcher_;
+
+ public:
+#ifdef TI_WITH_CC
+  // C backend related data structures
+  std::unique_ptr<cccp::CCProgram> cc_program;
+#endif
 };
 
 TLANG_NAMESPACE_END

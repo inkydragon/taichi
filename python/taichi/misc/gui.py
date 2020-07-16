@@ -1,11 +1,13 @@
 import numbers
 import numpy as np
+from taichi import ti_core
 
 
 class GUI:
     class Event:
         pass
 
+    # Event keys
     SHIFT = 'Shift'
     ALT = 'Alt'
     CTRL = 'Control'
@@ -19,12 +21,17 @@ class GUI:
     LEFT = 'Left'
     RIGHT = 'Right'
     CAPSLOCK = 'Caps_Lock'
-    MOTION = 'Motion'
     LMB = 'LMB'
     MMB = 'MMB'
     RMB = 'RMB'
-    RELEASE = False
-    PRESS = True
+    EXIT = 'WMClose'
+    WHEEL = 'Wheel'
+    MOVE = 'Motion'
+
+    # Event types
+    MOTION = ti_core.KeyEvent.EType.Move
+    PRESS = ti_core.KeyEvent.EType.Press
+    RELEASE = ti_core.KeyEvent.EType.Release
 
     def __init__(self, name, res=512, background_color=0x0):
         import taichi as ti
@@ -32,47 +39,124 @@ class GUI:
         if isinstance(res, numbers.Number):
             res = (res, res)
         self.res = res
+        # The GUI canvas uses RGBA for storage, therefore we need NxMx4 for an image.
+        self.img = np.ascontiguousarray(np.zeros(self.res + (4, ), np.float32))
         self.core = ti.core.GUI(name, ti.veci(*res))
         self.canvas = self.core.get_canvas()
         self.background_color = background_color
         self.key_pressed = set()
         self.event = None
+        self.frame = 0
         self.clear()
-        if ti.core.get_current_program():
-            self.core.set_profiler(
-                ti.core.get_current_program().get_profiler())
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, type, val, tb):
+        self.core = None  # dereference to call GUI::~GUI()
+
+    ## Widget system
+
+    class WidgetValue:
+        def __init__(self, gui, wid):
+            self.gui = gui
+            self.wid = wid
+
+        @property
+        def value(self):
+            return self.gui.core.get_widget_value(self.wid)
+
+        @value.setter
+        def value(self, value):
+            self.gui.core.set_widget_value(self.wid, value)
+
+    def slider(self, text, minimum, maximum, step=1):
+        wid = self.core.make_slider(text, minimum, minimum, maximum, step)
+        return GUI.WidgetValue(self, wid)
+
+    def label(self, text):
+        wid = self.core.make_label(text, 0)
+        return GUI.WidgetValue(self, wid)
+
+    def button(self, text, event_name=None):
+        event_name = event_name or f'WidgetButton_{text}'
+        self.core.make_button(text, event_name)
+        return event_name
+
+    ## Drawing system
 
     def clear(self, color=None):
         if color is None:
             color = self.background_color
         self.canvas.clear(color)
 
-    def set_image(self, img):
-        import numpy as np
-        from .image import cook_image
-        img = cook_image(img)
+    def cook_image(self, img):
         if img.dtype in [np.uint8, np.uint16, np.uint32, np.uint64]:
             img = img.astype(np.float32) * (1 / np.iinfo(img.dtype).max)
         elif img.dtype in [np.float32, np.float64]:
-            img = np.clip(img.astype(np.float32), 0, 1)
+            img = img.astype(np.float32)
         else:
             raise ValueError(
                 f'Data type {img.dtype} not supported in GUI.set_image')
+
         if len(img.shape) == 2:
             img = img[..., None]
+
         if img.shape[2] == 1:
-            img = img + np.zeros(shape=(1, 1, 4))
+            img = img + np.zeros((1, 1, 4), np.float32)
         if img.shape[2] == 3:
-            img = np.concatenate([
-                img,
-                np.zeros(shape=(img.shape[0], img.shape[1], 1),
-                         dtype=np.float32)
-            ],
-                                 axis=2)
-        img = img.astype(np.float32)
-        assert img.shape[:
-                         2] == self.res, "Image resolution does not match GUI resolution"
-        self.core.set_img(np.ascontiguousarray(img).ctypes.data)
+            zeros = np.zeros((img.shape[0], img.shape[1], 1), np.float32)
+            img = np.concatenate([img, zeros], axis=2)
+
+        res = img.shape[:2]
+        assert res == self.res, "Image resolution does not match GUI resolution"
+        return np.ascontiguousarray(img)
+
+    def get_image(self):
+        self.img = np.ascontiguousarray(self.img)
+        self.core.get_img(self.img.ctypes.data)
+        return self.img
+
+    def set_image(self, img):
+        import numpy as np
+        import taichi as ti
+
+        if isinstance(img, ti.Expr):
+            if ti.core.is_integral(img.dtype) or len(img.shape) != 2:
+                # Images of uint is not optimized by xxx_to_image
+                self.img = self.cook_image(img.to_numpy())
+            else:
+                # Type matched! We can use an optimized copy kernel.
+                assert img.shape \
+                 == self.res, "Image resolution does not match GUI resolution"
+                from taichi.lang.meta import tensor_to_image
+                tensor_to_image(img, self.img)
+                ti.sync()
+
+        elif isinstance(img, ti.Matrix):
+            if ti.core.is_integral(img.dtype):
+                self.img = self.cook_image(img.to_numpy())
+            else:
+                # Type matched! We can use an optimized copy kernel.
+                assert img.shape \
+                 == self.res, "Image resolution does not match GUI resolution"
+                assert img.n in [
+                    3, 4
+                ], "Only greyscale, RGB or RGBA images are supported in GUI.set_image"
+                assert img.m == 1
+                from taichi.lang.meta import vector_to_image
+                vector_to_image(img, self.img)
+                ti.sync()
+
+        elif isinstance(img, np.ndarray):
+            self.img = self.cook_image(img)
+
+        else:
+            raise ValueError(
+                f"GUI.set_image only takes a Taichi tensor or NumPy array, not {type(img)}"
+            )
+
+        self.core.set_img(self.img.ctypes.data)
 
     def circle(self, pos, color=0xFFFFFF, radius=1):
         self.canvas.circle_single(pos[0], pos[1], color, radius)
@@ -146,7 +230,11 @@ class GUI:
         self.core.update()
         if file:
             self.core.screenshot(file)
-        self.clear(self.background_color)
+        self.frame += 1
+        self.clear()
+        self.frame += 1
+
+    ## Event system
 
     class EventFilter:
         def __init__(self, *filter):
@@ -173,7 +261,8 @@ class GUI:
         for e in self.get_events(*filter):
             self.event = e
             return True
-        return False
+        else:
+            return False
 
     def get_events(self, *filter):
         filter = filter and GUI.EventFilter(*filter) or None
@@ -187,19 +276,30 @@ class GUI:
 
     def get_key_event(self):
         self.core.wait_key_event()
+
         e = GUI.Event()
-        e.key = self.core.get_key_event_head_key()
-        e.type = self.core.get_key_event_head_type()
-        e.pos = self.core.get_key_event_head_pos()
+        event = self.core.get_key_event_head()
+
+        e.type = event.type
+        e.key = event.key
+        e.pos = self.core.canvas_untransform(event.pos)
         e.pos = (e.pos[0], e.pos[1])
         e.modifier = []
+
+        if e.key == GUI.WHEEL:
+            e.delta = event.delta
+        else:
+            e.delta = (0, 0)
+
         for mod in ['Shift', 'Alt', 'Control']:
             if self.is_pressed(mod):
                 e.modifier.append(mod)
+
         if e.type == GUI.PRESS:
             self.key_pressed.add(e.key)
         else:
             self.key_pressed.discard(e.key)
+
         self.core.pop_key_event_head()
         return e
 
@@ -208,7 +308,7 @@ class GUI:
             if key in ['Shift', 'Alt', 'Control']:
                 if key + '_L' in self.key_pressed or key + '_R' in self.key_pressed:
                     return True
-            elif key in self.key_pressed:
+            if key in self.key_pressed:
                 return True
         else:
             return False
@@ -218,9 +318,25 @@ class GUI:
         return pos[0], pos[1]
 
     def has_key_pressed(self):
+        import warnings
+        warnings.warn(
+            'gui.has_key_pressed() is deprecated, use gui.get_event() instead.',
+            DeprecationWarning,
+            stacklevel=3)
         if self.has_key_event():
             self.get_key_event()  # pop to update self.key_pressed
         return len(self.key_pressed) != 0
+
+    @property
+    def running(self):
+        return not self.core.should_close
+
+    @running.setter
+    def running(self, value):
+        if value:
+            self.core.should_close = 0
+        elif not self.core.should_close:
+            self.core.should_close = 1
 
 
 def rgb_to_hex(c):

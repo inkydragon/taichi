@@ -48,8 +48,7 @@ class FixBlockParents : public IRVisitor {
   }
 
   void visit(OffloadedStmt *stmt) override {
-    if (stmt->body)
-      stmt->body->accept(this);
+    stmt->all_blocks_accept(this);
   }
 
   void run() {

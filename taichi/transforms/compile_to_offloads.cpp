@@ -2,6 +2,7 @@
 #include "taichi/ir/transforms.h"
 #include "taichi/ir/analysis.h"
 #include "taichi/ir/visitors.h"
+#include "taichi/program/kernel.h"
 
 TLANG_NAMESPACE_BEGIN
 
@@ -13,14 +14,18 @@ void compile_to_offloads(IRNode *ir,
                          bool grad,
                          bool ad_use_stack,
                          bool verbose,
-                         bool lower_global_access) {
+                         bool lower_global_access,
+                         bool make_thread_local,
+                         bool make_block_local) {
   TI_AUTO_PROF;
 
   auto print = [&](const std::string &name) {
     if (verbose) {
       TI_INFO(name + ":");
+      std::cout << std::flush;
       irpass::re_id(ir);
       irpass::print(ir);
+      std::cout << std::flush;
     }
   };
 
@@ -38,6 +43,14 @@ void compile_to_offloads(IRNode *ir,
   print("Typechecked");
   irpass::analysis::verify(ir);
 
+  if (ir->get_kernel()->is_evaluator) {
+    TI_ASSERT(!grad);
+    irpass::offload(ir);
+    print("Offloaded");
+    irpass::analysis::verify(ir);
+    return;
+  }
+
   if (vectorize) {
     irpass::loop_vectorize(ir);
     print("Loop Vectorized");
@@ -47,16 +60,18 @@ void compile_to_offloads(IRNode *ir,
     print("Loop Split");
     irpass::analysis::verify(ir);
   }
-  irpass::simplify(ir);
+  irpass::full_simplify(ir, false);
   print("Simplified I");
   irpass::analysis::verify(ir);
 
   if (grad) {
+    // Remove local atomics here so that we don't have to handle their gradients
     irpass::demote_atomics(ir);
-    irpass::full_simplify(ir);
-    irpass::make_adjoint(ir, ad_use_stack);
-    irpass::full_simplify(ir);
-    print("Adjoint");
+
+    irpass::full_simplify(ir, false);
+    irpass::auto_diff(ir, ad_use_stack);
+    irpass::full_simplify(ir, false);
+    print("Gradient");
     irpass::analysis::verify(ir);
   }
 
@@ -73,13 +88,39 @@ void compile_to_offloads(IRNode *ir,
     irpass::analysis::verify(ir);
   }
 
-  irpass::extract_constant(ir);
-  print("Constant extracted");
+  irpass::flag_access(ir);
+  print("Access flagged I");
   irpass::analysis::verify(ir);
 
-  irpass::variable_optimization(ir, false);
-  print("Store forwarded");
+  irpass::full_simplify(ir, false);
+  print("Simplified II");
   irpass::analysis::verify(ir);
+
+  irpass::offload(ir);
+  print("Offloaded");
+  irpass::analysis::verify(ir);
+
+  irpass::cfg_optimization(ir, false);
+  print("Optimized by CFG");
+  irpass::analysis::verify(ir);
+
+  irpass::flag_access(ir);
+
+  print("Access flagged II");
+  irpass::analysis::verify(ir);
+
+  if (make_thread_local) {
+    irpass::make_thread_local(ir);
+    print("Make thread local");
+  }
+
+  if (make_block_local) {
+    irpass::make_block_local(ir);
+    print("Make block local");
+  }
+
+  irpass::remove_range_assumption(ir);
+  print("Remove range assumption");
 
   if (lower_global_access) {
     irpass::lower_access(ir, true);
@@ -89,44 +130,17 @@ void compile_to_offloads(IRNode *ir,
     irpass::die(ir);
     print("DIE");
     irpass::analysis::verify(ir);
-  }
 
-  irpass::full_simplify(ir);
-  print("Simplified II");
-  irpass::analysis::verify(ir);
-
-  irpass::flag_access(ir);
-  print("Access flagged");
-  irpass::analysis::verify(ir);
-
-  irpass::constant_fold(ir);
-  print("Constant folded");
-
-  irpass::offload(ir);
-  print("Offloaded");
-  irpass::analysis::verify(ir);
-
-  if (!lower_global_access) {
     irpass::flag_access(ir);
-    print("Access flagged after offloading");
+    print("Access flagged III");
     irpass::analysis::verify(ir);
   }
-
-  irpass::extract_constant(ir);
-  print("Constant extracted II");
 
   irpass::demote_atomics(ir);
   print("Atomics demoted");
   irpass::analysis::verify(ir);
 
-  irpass::variable_optimization(ir, true);
-  print("Store forwarded II");
-
-  irpass::cfg_optimization(ir);
-  print("Optimized by CFG");
-  irpass::analysis::verify(ir);
-
-  irpass::full_simplify(ir);
+  irpass::full_simplify(ir, lower_global_access);
   print("Simplified III");
 
   // Final field registration correctness & type checking

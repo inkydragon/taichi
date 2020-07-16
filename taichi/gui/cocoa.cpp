@@ -97,22 +97,6 @@ std::string lookup_keysym(ushort keycode) {
       return "BackSpace";
     case kVK_Escape:
       return "Escape";
-    case kVK_Shift:
-      return "Shift_L";
-    case kVK_RightShift:
-      return "Shift_R";
-    // Shall we interpret Command key as Ctrl?
-    case kVK_Control:
-      return "Control_L";
-    case kVK_RightControl:
-      return "Control_R";
-    // Mac Option = Alt on other platforms
-    case kVK_Option:
-      return "Alt_L";
-    case kVK_RightOption:
-      return "Alt_R";
-    case kVK_CapsLock:
-      return "Caps_Lock";
     case kVK_Space:
       return " ";
     default:
@@ -133,6 +117,45 @@ std::string lookup_keysym(ushort keycode) {
 constexpr int NSApplicationActivationPolicyRegular = 0;
 constexpr int NSEventTypeKeyDown = 10;
 constexpr int NSEventTypeKeyUp = 11;
+constexpr int NSEventTypeFlagsChanged = 12;
+constexpr int NSEventTypeScrollWheel = 22;
+
+struct ModifierFlagsHandler {
+  struct Result {
+    std::vector<std::string> released;
+  };
+
+  static Result handle(unsigned int flag,
+                       std::unordered_map<std::string, bool> *active_flags) {
+    constexpr int NSEventModifierFlagCapsLock = 1 << 16;
+    constexpr int NSEventModifierFlagShift = 1 << 17;
+    constexpr int NSEventModifierFlagControl = 1 << 18;
+    constexpr int NSEventModifierFlagOption = 1 << 19;
+    constexpr int NSEventModifierFlagCommand = 1 << 20;
+    const static std::unordered_map<int, std::string> flag_mask_to_name = {
+        {NSEventModifierFlagCapsLock, "Caps_Lock"},
+        {NSEventModifierFlagShift, "Shift"},
+        {NSEventModifierFlagControl, "Control"},
+        // Mac Option = Alt on other platforms
+        {NSEventModifierFlagOption, "Alt"},
+        {NSEventModifierFlagCommand, "Command"},
+    };
+    Result result;
+    for (const auto &kv : flag_mask_to_name) {
+      bool &cur = (*active_flags)[kv.second];
+      if (flag & kv.first) {
+        cur = true;
+      } else {
+        if (cur) {
+          // If previously pressed, trigger a release event
+          result.released.push_back(kv.second);
+        }
+        cur = false;
+      }
+    }
+    return result;
+  }
+};
 
 // We need to give the View class a somewhat unique name, so that it won't
 // conflict with other modules (e.g. matplotlib). See issue#998.
@@ -204,6 +227,12 @@ void updateLayer(id self, SEL _) {
   CGColorSpaceRelease(colorspace);
 }
 
+BOOL windowShouldClose(id self, SEL _, id sender) {
+  auto *gui = gui_from_id[sender];
+  gui->window_received_close.store(true);
+  return true;
+}
+
 Class ViewClass;
 Class AppDelClass;
 
@@ -227,6 +256,10 @@ __attribute__((constructor)) static void initView() {
 
   AppDelClass = objc_allocateClassPair((Class)objc_getClass("NSObject"),
                                        "AppDelegate", 0);
+  Protocol *WinDelProtocol = objc_getProtocol("NSWindowDelegate");
+  class_addMethod(AppDelClass, sel_getUid("windowShouldClose:"),
+                  (IMP)windowShouldClose, "c@:@");
+  class_addProtocol(AppDelClass, WinDelProtocol);
   objc_registerClassPair(AppDelClass);
 }
 
@@ -265,9 +298,12 @@ void GUI::create_window() {
        0, false);
   view = call(clscall(kTaichiViewClassName, "alloc"), "initWithFrame:", rect);
   gui_from_id[view] = this;
+  // Needed by NSWindowDelegate
+  gui_from_id[window] = this;
   // Use layer to speed up the draw
   // https://developer.apple.com/documentation/appkit/nsview/1483695-wantslayer?language=objc
   call(view, "setWantsLayer:", YES);
+  call(window, "setDelegate:", appDelObj);
   call(window, "setContentView:", view);
   call(window, "becomeFirstResponder");
   call(window, "setAcceptsMouseMovedEvents:", YES);
@@ -318,7 +354,7 @@ void GUI::process_event() {
           mouse_event(MouseEvent{MouseEvent::Type::move, Vector2i(p.x, p.y)});
           break;
         case NSEventTypeKeyDown:
-        case NSEventTypeKeyUp:
+        case NSEventTypeKeyUp: {
           keycode = cast_call<ushort>(event, "keyCode");
           keysym = lookup_keysym(keycode);
           auto kev_type = (event_type == NSEventTypeKeyDown)
@@ -326,10 +362,41 @@ void GUI::process_event() {
                               : KeyEvent::Type::release;
           key_events.push_back(KeyEvent{kev_type, keysym, cursor_pos});
           break;
+        }
+        case NSEventTypeFlagsChanged: {
+          const auto modflag = cast_call<unsigned long>(event, "modifierFlags");
+          const auto r =
+              ModifierFlagsHandler::handle(modflag, &active_modifier_flags);
+          for (const auto &key : r.released) {
+            key_events.push_back(
+                KeyEvent{KeyEvent::Type::release, key, cursor_pos});
+          }
+          break;
+        }
+        case NSEventTypeScrollWheel: {
+          set_mouse_pos(p.x, p.y);
+          const auto dx = (int)cast_call<CGFloat>(event, "scrollingDeltaX");
+          // Mac trackpad's vertical scroll is reversed.
+          const auto dy = -(int)cast_call<CGFloat>(event, "scrollingDeltaY");
+          key_events.push_back(KeyEvent{KeyEvent::Type::move, "Wheel",
+                                        cursor_pos, Vector2i{dx, dy}});
+          break;
+        }
       }
     } else {
       break;
     }
+  }
+
+  for (const auto &kv : active_modifier_flags) {
+    if (kv.second) {
+      key_events.push_back(
+          KeyEvent{KeyEvent::Type::press, kv.first, cursor_pos});
+    }
+  }
+  if (window_received_close.load()) {
+    send_window_close_message();
+    window_received_close.store(false);
   }
 }
 

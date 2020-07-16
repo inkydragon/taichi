@@ -1,6 +1,7 @@
 #include "taichi/ir/ir.h"
 #include "taichi/ir/transforms.h"
 #include "taichi/ir/visitors.h"
+#include "taichi/program/kernel.h"
 #include <set>
 
 TLANG_NAMESPACE_BEGIN
@@ -9,6 +10,7 @@ class CheckOutOfBound : public BasicStmtVisitor {
  public:
   using BasicStmtVisitor::visit;
   std::set<int> visited;
+  DelayedIRModifier modifier;
 
   CheckOutOfBound() : BasicStmtVisitor(), visited() {
   }
@@ -26,32 +28,49 @@ class CheckOutOfBound : public BasicStmtVisitor {
       return;
     TI_ASSERT(stmt->snodes.size() == 1);
     auto snode = stmt->snodes[0];
+    if (snode->type != SNodeType::place) {
+      // TODO: support non-place node bound check
+      return;
+    }
+    bool has_offset = !(snode->index_offsets.empty());
     auto new_stmts = VecStatement();
     auto zero = new_stmts.push_back<ConstStmt>(LaneAttribute<TypedConstant>(0));
     Stmt *result =
         new_stmts.push_back<ConstStmt>(LaneAttribute<TypedConstant>(true));
 
-    std::string msg = "Accessing Tensor of Size [";
+    std::string msg = fmt::format("(kernel={}) Accessing Tensor of Size [",
+                                  stmt->get_kernel()->name);
+    std::string offset_msg = "Offset [";
     std::vector<Stmt *> args;
     for (int i = 0; i < stmt->indices.size(); i++) {
-      auto check_zero = new_stmts.push_back<BinaryOpStmt>(
-          BinaryOpType::cmp_ge, stmt->indices[i], zero);
+      int offset_i = has_offset ? snode->index_offsets[i] : 0;
+      auto lower_bound = offset_i != 0
+                             ? new_stmts.push_back<ConstStmt>(
+                                   LaneAttribute<TypedConstant>(offset_i))
+                             : zero;
+      auto check_lower_bound = new_stmts.push_back<BinaryOpStmt>(
+          BinaryOpType::cmp_ge, stmt->indices[i], lower_bound);
       int size_i =
           snode->extractors[snode->physical_index_position[i]].num_elements;
-      auto bound =
-          new_stmts.push_back<ConstStmt>(LaneAttribute<TypedConstant>(size_i));
-      auto check_bound = new_stmts.push_back<BinaryOpStmt>(
-          BinaryOpType::cmp_lt, stmt->indices[i], bound);
-      auto check_i = new_stmts.push_back<BinaryOpStmt>(BinaryOpType::bit_and,
-                                                       check_zero, check_bound);
+      int upper_bound_i = offset_i + size_i;
+      auto upper_bound = new_stmts.push_back<ConstStmt>(
+          LaneAttribute<TypedConstant>(upper_bound_i));
+      auto check_upper_bound = new_stmts.push_back<BinaryOpStmt>(
+          BinaryOpType::cmp_lt, stmt->indices[i], upper_bound);
+      auto check_i = new_stmts.push_back<BinaryOpStmt>(
+          BinaryOpType::bit_and, check_lower_bound, check_upper_bound);
       result = new_stmts.push_back<BinaryOpStmt>(BinaryOpType::bit_and, result,
                                                  check_i);
-      if (i > 0)
+      if (i > 0) {
         msg += ", ";
+        offset_msg += ", ";
+      }
       msg += std::to_string(size_i);
+      offset_msg += std::to_string(offset_i);
       args.emplace_back(stmt->indices[i]);
     }
-    msg += "] with indices (";
+    offset_msg += "]";
+    msg += "] " + (has_offset ? offset_msg : "") + " with indices (";
     for (int i = 0; i < stmt->indices.size(); i++) {
       if (i > 0)
         msg += ", ";
@@ -60,29 +79,29 @@ class CheckOutOfBound : public BasicStmtVisitor {
     msg += ")";
 
     new_stmts.push_back<AssertStmt>(result, msg, args);
-    stmt->parent->insert_before(stmt, std::move(new_stmts));
+    modifier.insert_before(stmt, std::move(new_stmts));
     set_done(stmt);
-    throw IRModified();
   }
 
-  static void run(IRNode *node) {
+  static bool run(IRNode *node) {
     CheckOutOfBound checker;
+    bool modified = false;
     while (true) {
-      bool modified = false;
-      try {
-        node->accept(&checker);
-      } catch (IRModified) {
+      node->accept(&checker);
+      if (checker.modifier.modify_ir()) {
         modified = true;
-      }
-      if (!modified)
+      } else {
         break;
+      }
     }
+    return modified;
   }
 };
 
 namespace irpass {
 
-void check_out_of_bound(IRNode *root) {
+bool check_out_of_bound(IRNode *root) {
+  TI_AUTO_PROF;
   return CheckOutOfBound::run(root);
 }
 

@@ -6,6 +6,7 @@
 #include <unordered_set>
 #include <unordered_map>
 #include <variant>
+#include <tuple>
 #include "taichi/common/core.h"
 #include "taichi/util/bit.h"
 #include "taichi/lang_util.h"
@@ -31,8 +32,6 @@ using ScratchPadOptions = std::vector<std::pair<int, SNode *>>;
 #undef PER_STATEMENT
 
 IRBuilder &current_ast_builder();
-
-bool maybe_same_address(Stmt *var1, Stmt *var2);
 
 struct VectorType {
  private:
@@ -215,6 +214,8 @@ class IRVisitor {
     invoke_default_visitor = false;
   }
 
+  virtual ~IRVisitor() = default;
+
   // default visitor
   virtual void visit(Stmt *stmt) {
     if (!allow_undefined_visitor) {
@@ -240,6 +241,8 @@ class IRVisitor {
 #undef PER_STATEMENT
 };
 
+struct CompileConfig;
+
 class IRNode {
  public:
   virtual void accept(IRVisitor *visitor) {
@@ -249,6 +252,8 @@ class IRNode {
     return nullptr;
   }
   virtual ~IRNode() = default;
+
+  CompileConfig &get_config() const;
 
   template <typename T>
   bool is() const {
@@ -572,6 +577,14 @@ class Stmt : public IRNode {
     return true;
   }
 
+  virtual bool dead_instruction_eliminable() const {
+    return !has_global_side_effect();
+  }
+
+  virtual bool common_statement_eliminable() const {
+    return !has_global_side_effect();
+  }
+
   template <typename T, typename... Args>
   static std::unique_ptr<T> make_typed(Args &&... args) {
     return std::make_unique<T>(std::forward<Args>(args)...);
@@ -609,7 +622,11 @@ class AllocaStmt : public Stmt {
     TI_STMT_REG_FIELDS;
   }
 
-  virtual bool has_global_side_effect() const override {
+  bool has_global_side_effect() const override {
+    return false;
+  }
+
+  bool common_statement_eliminable() const override {
     return false;
   }
 
@@ -678,7 +695,7 @@ class UnaryOpStmt : public Stmt {
   bool same_operation(UnaryOpStmt *o) const;
   bool is_cast() const;
 
-  virtual bool has_global_side_effect() const override {
+  bool has_global_side_effect() const override {
     return false;
   }
 
@@ -695,7 +712,7 @@ class ArgLoadStmt : public Stmt {
     TI_STMT_REG_FIELDS;
   }
 
-  virtual bool has_global_side_effect() const override {
+  bool has_global_side_effect() const override {
     return false;
   }
 
@@ -710,7 +727,11 @@ class RandStmt : public Stmt {
     TI_STMT_REG_FIELDS;
   }
 
-  virtual bool has_global_side_effect() const override {
+  bool has_global_side_effect() const override {
+    return false;
+  }
+
+  bool common_statement_eliminable() const override {
     return false;
   }
 
@@ -730,7 +751,7 @@ class BinaryOpStmt : public Stmt {
     TI_STMT_REG_FIELDS;
   }
 
-  virtual bool has_global_side_effect() const override {
+  bool has_global_side_effect() const override {
     return false;
   }
 
@@ -751,7 +772,7 @@ class TernaryOpStmt : public Stmt {
     TI_STMT_REG_FIELDS;
   }
 
-  virtual bool has_global_side_effect() const override {
+  bool has_global_side_effect() const override {
     return false;
   }
 
@@ -777,16 +798,15 @@ class ExternalPtrStmt : public Stmt {
  public:
   LaneAttribute<Stmt *> base_ptrs;
   std::vector<Stmt *> indices;
-  bool activate;
 
   ExternalPtrStmt(const LaneAttribute<Stmt *> &base_ptrs,
                   const std::vector<Stmt *> &indices);
 
-  virtual bool has_global_side_effect() const override {
+  bool has_global_side_effect() const override {
     return false;
   }
 
-  TI_STMT_DEF_FIELDS(ret_type, base_ptrs, indices, activate);
+  TI_STMT_DEF_FIELDS(ret_type, base_ptrs, indices);
   TI_DEFINE_ACCEPT_AND_CLONE
 };
 
@@ -800,8 +820,12 @@ class GlobalPtrStmt : public Stmt {
                 const std::vector<Stmt *> &indices,
                 bool activate = true);
 
-  virtual bool has_global_side_effect() const override {
+  bool has_global_side_effect() const override {
     return activate;
+  }
+
+  bool common_statement_eliminable() const override {
+    return true;
   }
 
   TI_STMT_DEF_FIELDS(ret_type, snodes, indices, activate);
@@ -832,14 +856,20 @@ class Block : public IRNode {
   void erase(Stmt *stmt);
   std::unique_ptr<Stmt> extract(int location);
   std::unique_ptr<Stmt> extract(Stmt *stmt);
-  void insert(std::unique_ptr<Stmt> &&stmt, int location = -1);
-  void insert(VecStatement &&stmt, int location = -1);
+
+  // Returns stmt.get()
+  Stmt *insert(std::unique_ptr<Stmt> &&stmt, int location = -1);
+
+  // Returns stmt.back().get() or nullptr if stmt is empty
+  Stmt *insert(VecStatement &&stmt, int location = -1);
+
   void replace_statements_in_range(int start, int end, VecStatement &&stmts);
   void set_statements(VecStatement &&stmts);
   void replace_with(Stmt *old_statement,
                     std::unique_ptr<Stmt> &&new_statement,
                     bool replace_usages = true);
   void insert_before(Stmt *old_statement, VecStatement &&new_statements);
+  void insert_after(Stmt *old_statement, VecStatement &&new_statements);
   void replace_with(Stmt *old_statement,
                     VecStatement &&new_statements,
                     bool replace_usages = true);
@@ -875,6 +905,8 @@ class Block : public IRNode {
 class DelayedIRModifier {
  private:
   std::vector<std::pair<Stmt *, VecStatement>> to_insert_before;
+  std::vector<std::pair<Stmt *, VecStatement>> to_insert_after;
+  std::vector<std::tuple<Stmt *, VecStatement, bool>> to_replace_with;
   std::vector<Stmt *> to_erase;
 
  public:
@@ -882,6 +914,11 @@ class DelayedIRModifier {
   void erase(Stmt *stmt);
   void insert_before(Stmt *old_statement, std::unique_ptr<Stmt> new_statement);
   void insert_before(Stmt *old_statement, VecStatement &&new_statements);
+  void insert_after(Stmt *old_statement, std::unique_ptr<Stmt> new_statement);
+  void insert_after(Stmt *old_statement, VecStatement &&new_statements);
+  void replace_with(Stmt *stmt,
+                    VecStatement &&new_statements,
+                    bool replace_usages = true);
   bool modify_ir();
 };
 
@@ -902,10 +939,9 @@ class SNodeOpStmt : public Stmt {
               SNode *snode,
               const std::vector<Stmt *> &indices);
 
-  static bool activation_related(SNodeOpType op) {
-    return op == SNodeOpType::activate || op == SNodeOpType::deactivate ||
-           op == SNodeOpType::is_active;
-  }
+  static bool activation_related(SNodeOpType op);
+
+  static bool need_activation(SNodeOpType op);
 
   TI_STMT_DEF_FIELDS(ret_type, op_type, snode, ptr, val, indices);
   TI_DEFINE_ACCEPT_AND_CLONE
@@ -934,6 +970,24 @@ class AssertStmt : public Stmt {
   TI_DEFINE_ACCEPT_AND_CLONE
 };
 
+class ExternalFuncCallStmt : public Stmt {
+ public:
+  void *func;
+  std::vector<Stmt *> arg_stmts;
+  std::vector<Stmt *> output_stmts;
+
+  ExternalFuncCallStmt(void *func,
+                       const std::vector<Stmt *> &arg_stmts,
+                       const std::vector<Stmt *> &output_stmts)
+      : func(func), arg_stmts(arg_stmts), output_stmts(output_stmts) {
+    TI_ASSERT(func);
+    TI_STMT_REG_FIELDS;
+  }
+
+  TI_STMT_DEF_FIELDS(func, arg_stmts, output_stmts);
+  TI_DEFINE_ACCEPT_AND_CLONE
+};
+
 class RangeAssumptionStmt : public Stmt {
  public:
   Stmt *input;
@@ -943,6 +997,14 @@ class RangeAssumptionStmt : public Stmt {
   RangeAssumptionStmt(Stmt *input, Stmt *base, int low, int high)
       : input(input), base(base), low(low), high(high) {
     TI_STMT_REG_FIELDS;
+  }
+
+  bool has_global_side_effect() const override {
+    return false;
+  }
+
+  bool dead_instruction_eliminable() const override {
+    return false;
   }
 
   TI_STMT_DEF_FIELDS(ret_type, input, base, low, high);
@@ -957,7 +1019,11 @@ class GlobalLoadStmt : public Stmt {
     TI_STMT_REG_FIELDS;
   }
 
-  virtual bool has_global_side_effect() const override {
+  bool has_global_side_effect() const override {
+    return false;
+  }
+
+  bool common_statement_eliminable() const override {
     return false;
   }
 
@@ -971,6 +1037,10 @@ class GlobalStoreStmt : public Stmt {
 
   GlobalStoreStmt(Stmt *ptr, Stmt *data) : ptr(ptr), data(data) {
     TI_STMT_REG_FIELDS;
+  }
+
+  bool common_statement_eliminable() const override {
+    return false;
   }
 
   TI_STMT_DEF_FIELDS(ret_type, ptr, data);
@@ -1002,7 +1072,11 @@ class LocalLoadStmt : public Stmt {
 
   Stmt *previous_store_or_alloca_in_block();
 
-  virtual bool has_global_side_effect() const override {
+  bool has_global_side_effect() const override {
+    return false;
+  }
+
+  bool common_statement_eliminable() const override {
     return false;
   }
 
@@ -1018,6 +1092,18 @@ class LocalStoreStmt : public Stmt {
   LocalStoreStmt(Stmt *ptr, Stmt *data) : ptr(ptr), data(data) {
     TI_ASSERT(ptr->is<AllocaStmt>());
     TI_STMT_REG_FIELDS;
+  }
+
+  bool has_global_side_effect() const override {
+    return false;
+  }
+
+  bool dead_instruction_eliminable() const override {
+    return false;
+  }
+
+  bool common_statement_eliminable() const override {
+    return false;
   }
 
   TI_STMT_DEF_FIELDS(ret_type, ptr, data);
@@ -1053,8 +1139,39 @@ class PrintStmt : public Stmt {
     TI_STMT_REG_FIELDS;
   }
 
+  template <typename... Args>
+  PrintStmt(Stmt *t, Args &&... args)
+      : contents(make_entries(t, std::forward<Args>(args)...)) {
+    TI_STMT_REG_FIELDS;
+  }
+
+  template <typename... Args>
+  PrintStmt(const std::string &str, Args &&... args)
+      : contents(make_entries(str, std::forward<Args>(args)...)) {
+    TI_STMT_REG_FIELDS;
+  }
+
   TI_STMT_DEF_FIELDS(ret_type, contents);
   TI_DEFINE_ACCEPT_AND_CLONE
+
+ private:
+  static void make_entries_helper(std::vector<PrintStmt::EntryType> &entries) {
+  }
+
+  template <typename T, typename... Args>
+  static void make_entries_helper(std::vector<PrintStmt::EntryType> &entries,
+                                  T &&t,
+                                  Args &&... values) {
+    entries.push_back(EntryType{t});
+    make_entries_helper(entries, std::forward<Args>(values)...);
+  }
+
+  template <typename... Args>
+  static std::vector<EntryType> make_entries(Args &&... values) {
+    std::vector<EntryType> ret;
+    make_entries_helper(ret, std::forward<Args>(values)...);
+    return ret;
+  }
 };
 
 class ConstStmt : public Stmt {
@@ -1075,7 +1192,7 @@ class ConstStmt : public Stmt {
     val.repeat(factor);
   }
 
-  virtual bool has_global_side_effect() const override {
+  bool has_global_side_effect() const override {
     return false;
   }
 
@@ -1131,6 +1248,7 @@ class StructForStmt : public Stmt {
   std::unique_ptr<Block> body;
   std::unique_ptr<Block> block_initialization;
   std::unique_ptr<Block> block_finalization;
+  std::vector<int> index_offsets;
   int vectorize;
   int parallelize;
   int block_dim;
@@ -1148,7 +1266,12 @@ class StructForStmt : public Stmt {
 
   std::unique_ptr<Stmt> clone() const override;
 
-  TI_STMT_DEF_FIELDS(snode, vectorize, parallelize, block_dim, scratch_opt);
+  TI_STMT_DEF_FIELDS(snode,
+                     index_offsets,
+                     vectorize,
+                     parallelize,
+                     block_dim,
+                     scratch_opt);
   TI_DEFINE_ACCEPT
 };
 
@@ -1180,10 +1303,6 @@ class FuncCallStmt : public Stmt {
     TI_STMT_REG_FIELDS;
   }
 
-  bool is_container_statement() const override {
-    return false;
-  }
-
   TI_STMT_DEF_FIELDS(ret_type, funcid);
   TI_DEFINE_ACCEPT_AND_CLONE
 };
@@ -1194,10 +1313,6 @@ class KernelReturnStmt : public Stmt {
 
   KernelReturnStmt(Stmt *value) : value(value) {
     TI_STMT_REG_FIELDS;
-  }
-
-  bool is_container_statement() const override {
-    return false;
   }
 
   TI_STMT_DEF_FIELDS(value);

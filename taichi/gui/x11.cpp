@@ -3,6 +3,7 @@
 #if defined(TI_GUI_X11)
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
+#include <cstdlib>
 
 // Undo terrible unprefixed macros in X.h
 #ifdef None
@@ -35,7 +36,7 @@ class CXImage {
         *p++ = uint8(clamp(int(c[2] * 255.0_f), 0, 255));
         *p++ = uint8(clamp(int(c[1] * 255.0_f), 0, 255));
         *p++ = uint8(clamp(int(c[0] * 255.0_f), 0, 255));
-        *p++ = uint8(clamp(int(c[3] * 255.0_f), 0, 255));
+        *p++ = 0;
       }
     }
   }
@@ -73,6 +74,12 @@ void GUI::process_event() {
     switch (ev.type) {
       case Expose:
         break;
+      case ClientMessage:
+        // https://stackoverflow.com/questions/10792361/how-do-i-gracefully-exit-an-x11-event-loop
+        if (ev.xclient.data.l[0] == *(Atom *)wmDeleteMessage.data()) {
+          send_window_close_message();
+        }
+        break;
       case MotionNotify:
         set_mouse_pos(ev.xbutton.x, height - ev.xbutton.y - 1);
         mouse_event(MouseEvent{MouseEvent::Type::move, cursor_pos});
@@ -82,8 +89,28 @@ void GUI::process_event() {
       case ButtonPress:
         set_mouse_pos(ev.xbutton.x, height - ev.xbutton.y - 1);
         mouse_event(MouseEvent{MouseEvent::Type::press, cursor_pos});
-        key_events.push_back(
-            KeyEvent{KeyEvent::Type::press, lookup_button(&ev), cursor_pos});
+        switch (ev.xbutton.button) {
+        case 4: // wheel up
+          key_events.push_back(
+              KeyEvent{KeyEvent::Type::move, "Wheel", cursor_pos, Vector2i{0, +120}});
+          break;
+        case 5: // wheel down
+          key_events.push_back(
+              KeyEvent{KeyEvent::Type::move, "Wheel", cursor_pos, Vector2i{0, -120}});
+          break;
+        case 6: // wheel right
+          key_events.push_back(
+              KeyEvent{KeyEvent::Type::move, "Wheel", cursor_pos, Vector2i{+120, 0}});
+          break;
+        case 7: // wheel left
+          key_events.push_back(
+              KeyEvent{KeyEvent::Type::move, "Wheel", cursor_pos, Vector2i{-120, 0}});
+          break;
+        default: // normal mouse button
+          key_events.push_back(
+              KeyEvent{KeyEvent::Type::press, lookup_button(&ev), cursor_pos});
+          break;
+        }
         break;
       case ButtonRelease:
         set_mouse_pos(ev.xbutton.x, height - ev.xbutton.y - 1);
@@ -114,6 +141,11 @@ void GUI::create_window() {
                ButtonPressMask | ExposureMask | KeyPressMask | KeyReleaseMask |
                    ButtonPress | ButtonReleaseMask | EnterWindowMask |
                    LeaveWindowMask | PointerMotionMask);
+  wmDeleteMessage = std::vector<char>(sizeof(Atom));
+  *(Atom *)wmDeleteMessage.data() =
+      XInternAtom((Display *)display, "WM_DELETE_WINDOW", False);
+  XSetWMProtocols((Display *)display, window, (Atom *)wmDeleteMessage.data(),
+                  1);
   XMapWindow((Display *)display, window);
   img = new CXImage((Display *)display, (Visual *)visual, width, height);
 }
@@ -129,6 +161,7 @@ void GUI::set_title(std::string title) {
 }
 
 GUI::~GUI() {
+  XCloseDisplay((Display *)display);
   delete img;
 }
 

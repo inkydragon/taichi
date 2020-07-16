@@ -3,6 +3,7 @@ import re
 import shutil
 import sys
 import ctypes
+import warnings
 from pathlib import Path
 from colorama import Fore, Back, Style
 from taichi.misc.settings import get_output_directory, get_build_directory, get_bin_directory, get_repo_directory, get_runtime_directory
@@ -12,6 +13,8 @@ if sys.version_info[0] < 3 or sys.version_info[1] <= 5:
     print("\nPlease restart with Python 3.6+\n")
     print("Current Python version:", sys.version_info)
     exit(-1)
+
+warnings.filterwarnings('always')
 
 ti_core = None
 
@@ -27,7 +30,7 @@ def import_ti_core(tmp_dir=None):
     global ti_core
     if get_os_name() != 'win':
         old_flags = sys.getdlopenflags()
-        sys.setdlopenflags(258)  # 258 = RTLD_NOW | RTLD_GLOBAL
+        sys.setdlopenflags(2 | 8)  # RTLD_NOW | RTLD_DEEPBIND
     else:
         pyddir = os.path.join(package_root(), 'lib')
         os.environ['PATH'] += ';' + pyddir
@@ -53,10 +56,9 @@ def import_ti_core(tmp_dir=None):
 def locale_encode(s):
     try:
         import locale
-        encoding = locale.getdefaultlocale()[1]
-    except:
-        encoding = 'utf8'
-    return s.encode(encoding)
+        return s.encode(locale.getdefaultlocale()[1])
+    except TypeError:
+        return s.encode('utf8')
 
 
 def is_ci():
@@ -246,9 +248,16 @@ def build():
     os.chdir(tmp_cwd)
 
 
+def check_exists(src):
+    if not os.path.exists(src):
+        raise FileNotFoundError(
+            f'File "{src}" not exist. Installation corrupted or build incomplete?'
+        )
+
+
 def prepare_sandbox(src):
     global g_tmp_dir
-    assert os.path.exists(src)
+    check_exists(src)
     import atexit
     import shutil
     from tempfile import mkdtemp
@@ -258,7 +267,6 @@ def prepare_sandbox(src):
     dest = os.path.join(tmp_dir, 'taichi_core.so')
     shutil.copy(src, dest)
     os.mkdir(os.path.join(tmp_dir, 'runtime/'))
-    print(f'[Taichi] sandbox prepared')
     return tmp_dir
 
 
@@ -297,7 +305,7 @@ else:
         else:
             os.environ['LD_LIBRARY_PATH'] = '/usr/lib64/'
         lib_path = os.path.join(bin_dir, 'libtaichi_core.so')
-        assert os.path.exists(lib_path)
+        check_exists(lib_path)
         tmp_cwd = os.getcwd()
         tmp_dir = prepare_sandbox(lib_path)
         os.chdir(tmp_dir)
@@ -313,11 +321,29 @@ else:
 
     elif get_os_name() == 'win':
         bin_dir = get_bin_directory()
-        dll_path1 = os.path.join(bin_dir, 'RelWithDebInfo', 'taichi_core.dll')
-        dll_path2 = os.path.join(bin_dir, 'libtaichi_core.dll')
-        assert os.path.exists(dll_path1) and not os.path.exists(dll_path2)
+        dll_path_invalid = os.path.join(bin_dir, 'libtaichi_core.dll')
+        assert not os.path.exists(dll_path_invalid)
 
-        # On windows when an dll/pyd is loaded, we can not write to it any more
+        possible_folders = ['Debug', 'RelWithDebInfo', 'Release']
+        detected_dlls = []
+        for folder in possible_folders:
+            dll_path = os.path.join(bin_dir, folder, 'taichi_core.dll')
+            if os.path.exists(dll_path):
+                detected_dlls.append(dll_path)
+
+        if len(detected_dlls) == 0:
+            raise FileNotFoundError(
+                f'Cannot find Taichi core dll under {get_bin_directory()}/{possible_folders}'
+            )
+        elif len(detected_dlls) != 1:
+            print('Warning: multiple Taichi core dlls found:')
+            for dll in detected_dlls:
+                print(' ', dll)
+            print(f'Using {detected_dlls[0]}')
+
+        dll_path = detected_dlls[0]
+
+        # On windows when an dll/pyd is loaded, we cannot write to it any more
         old_wd = os.getcwd()
         os.chdir(bin_dir)
 
@@ -330,10 +356,7 @@ else:
             os.environ['PATH'] += ';' + lib_dir
 
             os.makedirs(folder)
-            if os.path.exists(dll_path1):
-                shutil.copy(dll_path1, os.path.join(folder, 'taichi_core.pyd'))
-            else:
-                shutil.copy(dll_path2, os.path.join(folder, 'taichi_core.pyd'))
+            shutil.copy(dll_path, os.path.join(folder, 'taichi_core.pyd'))
             os.environ['PATH'] += ';' + folder
             sys.path.append(folder)
         else:
@@ -365,7 +388,7 @@ def get_dll_name(name):
     elif get_os_name() == 'win':
         return 'taichi_%s.dll' % name
     else:
-        assert False, "Unknown OS"
+        raise Exception(f"Unknown OS: {get_os_name()}")
 
 
 def load_module(name, verbose=True):
@@ -451,17 +474,8 @@ def _print_taichi_header():
     else:
         header += f'version {ti_core.get_version_string()}, '
 
-    supported_archs = ['cpu']
-    if ti_core.with_cuda():
-        supported_archs.append('cuda')
-    if ti_core.with_opengl():
-        supported_archs.append('opengl')
-    if ti_core.with_metal():
-        supported_archs.append('metal')
-    if len(supported_archs) == 1:
-        supported_archs[0] = 'cpu only'
-    archs_str = ', '.join(sorted(supported_archs))
-    header += f'supported archs: [{archs_str}], '
+    llvm_version = ti_core.get_llvm_version_string()
+    header += f'llvm {llvm_version}, '
 
     commit_hash = ti_core.get_commit_hash()
     commit_hash = commit_hash[:8]

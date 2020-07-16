@@ -1,3 +1,4 @@
+
 // Intermediate representations
 
 #include "taichi/ir/ir.h"
@@ -20,65 +21,8 @@ IRBuilder &current_ast_builder() {
   return context->builder();
 }
 
-bool maybe_same_address(Stmt *var1, Stmt *var2) {
-  // Return true when two statements might be the same address;
-  // false when two statements cannot be the same address.
-
-  // If both stmts are allocas, they have the same address iff var1 == var2.
-  // If only one of them is an alloca, they can never share the same address.
-  if (var1 == var2)
-    return true;
-  if (var1->is<AllocaStmt>() || var2->is<AllocaStmt>())
-    return false;
-
-  // If both statements are global temps, they have the same address iff they
-  // have the same offset. If only one of them is a global temp, they can never
-  // share the same address.
-  if (var1->is<GlobalTemporaryStmt>() || var2->is<GlobalTemporaryStmt>()) {
-    if (!var1->is<GlobalTemporaryStmt>() || !var2->is<GlobalTemporaryStmt>())
-      return false;
-    return var1->as<GlobalTemporaryStmt>()->offset ==
-           var2->as<GlobalTemporaryStmt>()->offset;
-  }
-
-  // If both statements are GlobalPtrStmts or GetChStmts, we can check by
-  // SNode::id.
-  TI_ASSERT(var1->width() == 1);
-  TI_ASSERT(var2->width() == 1);
-  auto get_snode_id = [](Stmt *s) {
-    if (auto ptr = s->cast<GlobalPtrStmt>())
-      return ptr->snodes[0]->id;
-    else if (auto get_child = s->cast<GetChStmt>())
-      return get_child->output_snode->id;
-    else
-      return -1;
-  };
-  int snode1 = get_snode_id(var1);
-  int snode2 = get_snode_id(var2);
-  if (snode1 != -1 && snode2 != -1 && snode1 != snode2)
-    return false;
-
-  // GlobalPtrStmts with guaranteed different indices cannot share the same
-  // address.
-  if (var1->is<GlobalPtrStmt>() && var2->is<GlobalPtrStmt>()) {
-    auto ptr1 = var1->as<GlobalPtrStmt>();
-    auto ptr2 = var2->as<GlobalPtrStmt>();
-    for (int i = 0; i < (int)ptr1->indices.size(); i++) {
-      if (!irpass::analysis::same_statements(ptr1->indices[i],
-                                             ptr2->indices[i])) {
-        if (ptr1->indices[i]->is<ConstStmt>() &&
-            ptr2->indices[i]->is<ConstStmt>()) {
-          // different constants
-          return false;
-        }
-      }
-    }
-    return true;
-  }
-
-  // In other cases (probably after lower_access), we don't know if the two
-  // statements share the same address.
-  return true;
+CompileConfig &IRNode::get_config() const {
+  return get_kernel()->program.config;
 }
 
 std::string VectorType::pointer_suffix() const {
@@ -418,6 +362,20 @@ void UnaryOpExpression::flatten(FlattenContext *ctx) {
   ctx->push_back(std::move(unary));
 }
 
+void ExternalFuncCallExpression::flatten(FlattenContext *ctx) {
+  std::vector<Stmt *> arg_statements, output_statements;
+  for (auto &s : args) {
+    s->flatten(ctx);
+    arg_statements.push_back(s->stmt);
+  }
+  for (auto &s : outputs) {
+    output_statements.push_back(s.cast<IdExpression>()->flatten_noload(ctx));
+  }
+  ctx->push_back(std::make_unique<ExternalFuncCallStmt>(func, arg_statements,
+                                                        output_statements));
+  stmt = ctx->back_stmt();
+}
+
 ExternalPtrStmt::ExternalPtrStmt(const LaneAttribute<Stmt *> &base_ptrs,
                                  const std::vector<Stmt *> &indices)
     : base_ptrs(base_ptrs), indices(indices) {
@@ -501,8 +459,6 @@ FrontendForStmt::FrontendForStmt(const Expr &loop_var,
     vectorize = 1;
     parallelize = 1;
   } else {
-    if (block_dim == 0)
-      block_dim = cfg.default_cpu_block_dim;
     if (parallelize == 0)
       parallelize = std::thread::hardware_concurrency();
   }
@@ -528,8 +484,6 @@ FrontendForStmt::FrontendForStmt(const ExprGroup &loop_var,
     TI_ASSERT(block_dim <= taichi_max_gpu_block_dim);
   } else {
     // cpu
-    if (block_dim == 0)
-      block_dim = cfg.default_cpu_block_dim;
     if (parallelize == 0)
       parallelize = std::thread::hardware_concurrency();
   }
@@ -652,22 +606,29 @@ std::unique_ptr<Stmt> Block::extract(Stmt *stmt) {
   TI_ERROR("stmt not found");
 }
 
-void Block::insert(std::unique_ptr<Stmt> &&stmt, int location) {
+Stmt *Block::insert(std::unique_ptr<Stmt> &&stmt, int location) {
+  auto stmt_ptr = stmt.get();
   stmt->parent = this;
   if (location == -1) {
     statements.push_back(std::move(stmt));
   } else {
     statements.insert(statements.begin() + location, std::move(stmt));
   }
+  return stmt_ptr;
 }
 
-void Block::insert(VecStatement &&stmt, int location) {
+Stmt *Block::insert(VecStatement &&stmt, int location) {
+  Stmt *stmt_ptr = nullptr;
+  if (stmt.size()) {
+    stmt_ptr = stmt.back().get();
+  }
   if (location == -1) {
-    location = (int)statements.size() - 1;
+    location = (int)statements.size();
   }
   for (int i = 0; i < stmt.size(); i++) {
     insert(std::move(stmt[i]), location + i);
   }
+  return stmt_ptr;
 }
 
 void Block::replace_statements_in_range(int start,
@@ -746,6 +707,20 @@ void Block::insert_before(Stmt *old_statement, VecStatement &&new_statements) {
   }
 }
 
+void Block::insert_after(Stmt *old_statement, VecStatement &&new_statements) {
+  int location = -1;
+  for (int i = 0; i < (int)statements.size(); i++) {
+    if (old_statement == statements[i].get()) {
+      location = i + 1;
+      break;
+    }
+  }
+  TI_ASSERT(location != -1);
+  for (int i = (int)new_statements.size() - 1; i >= 0; i--) {
+    insert(std::move(new_statements[i]), location);
+  }
+}
+
 void Block::replace_with(Stmt *old_statement,
                          VecStatement &&new_statements,
                          bool replace_usages) {
@@ -802,7 +777,9 @@ std::unique_ptr<Block> Block::clone() const {
 
 DelayedIRModifier::~DelayedIRModifier() {
   TI_ASSERT(to_insert_before.empty());
+  TI_ASSERT(to_insert_after.empty());
   TI_ASSERT(to_erase.empty());
+  TI_ASSERT(to_replace_with.empty());
 }
 
 void DelayedIRModifier::erase(Stmt *stmt) {
@@ -820,17 +797,43 @@ void DelayedIRModifier::insert_before(Stmt *old_statement,
   to_insert_before.emplace_back(old_statement, std::move(new_statements));
 }
 
+void DelayedIRModifier::insert_after(Stmt *old_statement,
+                                     std::unique_ptr<Stmt> new_statements) {
+  to_insert_after.emplace_back(old_statement,
+                               VecStatement(std::move(new_statements)));
+}
+
+void DelayedIRModifier::insert_after(Stmt *old_statement,
+                                     VecStatement &&new_statements) {
+  to_insert_after.emplace_back(old_statement, std::move(new_statements));
+}
+
+void DelayedIRModifier::replace_with(Stmt *stmt,
+                                     VecStatement &&new_statements,
+                                     bool replace_usages) {
+  to_replace_with.emplace_back(stmt, std::move(new_statements), replace_usages);
+}
+
 bool DelayedIRModifier::modify_ir() {
-  if (to_insert_before.empty() && to_erase.empty())
+  if (to_insert_before.empty() && to_insert_after.empty() && to_erase.empty() &&
+      to_replace_with.empty())
     return false;
   for (auto &i : to_insert_before) {
     i.first->parent->insert_before(i.first, std::move(i.second));
   }
   to_insert_before.clear();
+  for (auto &i : to_insert_after) {
+    i.first->parent->insert_after(i.first, std::move(i.second));
+  }
+  to_insert_after.clear();
   for (auto &stmt : to_erase) {
     stmt->parent->erase(stmt);
   }
   to_erase.clear();
+  for (auto &i : to_replace_with) {
+    std::get<0>(i)->replace_with(std::move(std::get<1>(i)), std::get<2>(i));
+  }
+  to_replace_with.clear();
   return true;
 }
 
@@ -864,10 +867,20 @@ SNodeOpStmt::SNodeOpStmt(SNodeOpType op_type,
   ptr = nullptr;
   val = nullptr;
   TI_ASSERT(op_type == SNodeOpType::is_active ||
-            op_type == SNodeOpType::deactivate);
+            op_type == SNodeOpType::deactivate ||
+            op_type == SNodeOpType::activate);
   width() = 1;
   element_type() = DataType::i32;
   TI_STMT_REG_FIELDS;
+}
+
+bool SNodeOpStmt::activation_related(SNodeOpType op) {
+  return op == SNodeOpType::activate || op == SNodeOpType::deactivate ||
+         op == SNodeOpType::is_active;
+}
+
+bool SNodeOpStmt::need_activation(SNodeOpType op) {
+  return op == SNodeOpType::activate || op == SNodeOpType::append;
 }
 
 std::string AtomicOpExpression::serialize() {

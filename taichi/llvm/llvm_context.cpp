@@ -17,7 +17,6 @@
 #include "llvm/IR/IntrinsicsNVPTX.h"
 #endif
 #include "llvm/IR/LLVMContext.h"
-#include "llvm/IR/LegacyPassManager.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Type.h"
 #include "llvm/IR/Verifier.h"
@@ -29,6 +28,10 @@
 #include "llvm/Transforms/Scalar/GVN.h"
 #include "llvm/Transforms/Utils.h"
 #include "llvm/Transforms/IPO.h"
+#include "llvm/Transforms/IPO/Internalize.h"
+#include "llvm/Transforms/IPO/GlobalDCE.h"
+#include "llvm/Pass.h"
+#include "llvm/Passes/PassBuilder.h"
 #include "llvm/Bitcode/BitcodeReader.h"
 #include "llvm/Linker/Linker.h"
 #include "llvm/Demangle/Demangle.h"
@@ -37,6 +40,13 @@
 #include "taichi/lang_util.h"
 #include "taichi/jit/jit_session.h"
 #include "taichi/common/task.h"
+#include "taichi/util/environ_config.h"
+#ifdef _WIN32
+// Travis CI seems doesn't support <filesystem>...
+#include <filesystem>
+#else
+#include <unistd.h>
+#endif
 
 TLANG_NAMESPACE_BEGIN
 
@@ -130,14 +140,44 @@ void compile_runtime_bitcode(Arch arch) {
   if (is_release())
     return;
   TI_AUTO_PROF;
+  bool do_cache = get_environ_config("TI_CACHE_RUNTIME_BITCODE", 0);
   static std::set<int> runtime_compiled;
   if (runtime_compiled.find((int)arch) == runtime_compiled.end()) {
-    auto clang =
-        find_existing_command({"clang-7", "clang-8", "clang-9", "clang"});
-    TI_ASSERT(command_exist("llvm-as"));
-    TI_TRACE("Compiling runtime module bitcode...");
     auto runtime_src_folder = get_runtime_src_dir();
     auto runtime_folder = get_runtime_dir();
+    auto fn_bc = get_runtime_fn(arch);
+    auto src_runtime_bc = fmt::format("{}{}", runtime_src_folder, fn_bc);
+    auto dst_runtime_bc = fmt::format("{}{}", runtime_folder, fn_bc);
+#ifdef _WIN32
+    namespace fs = std::filesystem;
+    bool src_exists = fs::exists(src_runtime_bc);
+#else
+    bool src_exists = !access(src_runtime_bc.c_str(), F_OK);
+#endif
+    if (do_cache && src_exists) {
+      TI_TRACE("Restoring cached runtime module bitcode [{}]...",
+               src_runtime_bc);
+#ifdef _WIN32
+      auto ret = fs::copy_file(src_runtime_bc, dst_runtime_bc,
+                               fs::copy_options::overwrite_existing);
+#else
+      auto ret =
+          (std::system(fmt::format("cp {} {}", src_runtime_bc, dst_runtime_bc)
+                           .c_str()) &
+           255) == 0;
+#endif
+      if (!ret) {
+        TI_WARN("Failed to copy from saved runtime bitcode cache.");
+      } else {
+        TI_TRACE("Runtime module bitcode loaded.");
+        runtime_compiled.insert((int)arch);
+        return;
+      }
+    }
+    auto clang = find_existing_command(
+        {"clang-7", "clang-8", "clang-9", "clang-10", "clang"});
+    TI_ASSERT(command_exist("llvm-as"));
+    TI_TRACE("Compiling runtime module bitcode...");
     std::string macro = fmt::format(" -D ARCH_{} ", arch_name(arch));
     auto cmd = fmt::format(
         "{} -S {}runtime.cpp -o {}runtime.ll -fno-exceptions "
@@ -147,11 +187,25 @@ void compile_runtime_bitcode(Arch arch) {
     if (ret) {
       TI_ERROR("LLVMRuntime compilation failed.");
     }
-    cmd = fmt::format("llvm-as {}runtime.ll -o {}{}", runtime_folder,
-                      runtime_folder, get_runtime_fn(arch));
+    cmd = fmt::format("llvm-as {}runtime.ll -o {}", runtime_folder,
+                      dst_runtime_bc);
     std::system(cmd.c_str());
-    TI_TRACE("runtime module bitcode compiled.");
+    TI_TRACE("Runtime module bitcode compiled.");
     runtime_compiled.insert((int)arch);
+    if (do_cache) {
+      TI_TRACE("Saving runtime module bitcode cache [{}]...", dst_runtime_bc);
+#ifdef _WIN32
+      auto ret = fs::copy_file(dst_runtime_bc, src_runtime_bc,
+                               fs::copy_options::overwrite_existing);
+#else
+      auto ret = (system(fmt::format("cp {} {}", dst_runtime_bc, src_runtime_bc)
+                             .c_str()) &
+                  255) == 0;
+#endif
+      if (!ret) {
+        TI_WARN("Failed to save runtime bitcode cache.");
+      }
+    }
   }
 }
 
@@ -301,6 +355,7 @@ std::unique_ptr<llvm::Module> TaichiLLVMContext::clone_runtime_module() {
                                  bool ret = true,
                                  std::vector<Type *> types = {}) {
         auto func = runtime_module->getFunction(name);
+        TI_ERROR_UNLESS(func, "Function {} not found", name);
         func->deleteBody();
         auto bb = llvm::BasicBlock::Create(*ctx, "entry", func);
         IRBuilder<> builder(*ctx);
@@ -334,6 +389,7 @@ std::unique_ptr<llvm::Module> TaichiLLVMContext::clone_runtime_module() {
       };
 
       patch_intrinsic("thread_idx", Intrinsic::nvvm_read_ptx_sreg_tid_x);
+      patch_intrinsic("cuda_clock_i64", Intrinsic::nvvm_read_ptx_sreg_clock64);
       patch_intrinsic("block_idx", Intrinsic::nvvm_read_ptx_sreg_ctaid_x);
       patch_intrinsic("block_dim", Intrinsic::nvvm_read_ptx_sreg_ntid_x);
       patch_intrinsic("grid_dim", Intrinsic::nvvm_read_ptx_sreg_nctaid_x);
@@ -602,13 +658,21 @@ void TaichiLLVMContext::eliminate_unused_functions(
     std::function<bool(const std::string &)> export_indicator) {
   TI_AUTO_PROF
   using namespace llvm;
-  legacy::PassManager manager;
-  ModuleAnalysisManager ana;
-  manager.add(createInternalizePass([&](const GlobalValue &val) -> bool {
+  TI_ASSERT(module);
+  if (0) {  // temporary fix for now to make LLVM 8 work with CUDA
+    if (llvm::verifyModule(*module, &llvm::errs())) {
+      TI_ERROR("Module broken\n");
+    }
+  }
+  llvm::ModulePassManager manager;
+  llvm::ModuleAnalysisManager ana;
+  llvm::PassBuilder pb;
+  pb.registerModuleAnalyses(ana);
+  manager.addPass(llvm::InternalizePass([&](const GlobalValue &val) -> bool {
     return export_indicator(val.getName());
   }));
-  manager.add(createGlobalDCEPass());
-  manager.run(*module);
+  manager.addPass(GlobalDCEPass());
+  manager.run(*module, ana);
 }
 
 TaichiLLVMContext::ThreadLocalData *TaichiLLVMContext::get_this_thread_data() {
@@ -667,7 +731,7 @@ template llvm::Value *TaichiLLVMContext::get_constant(unsigned long t);
 
 auto make_slim_libdevice = [](const std::vector<std::string> &args) {
   TI_ASSERT_INFO(args.size() == 1,
-                 "Usage: ti run make_slim_libdevice [libdevice.X.bc file]");
+                 "Usage: ti task make_slim_libdevice [libdevice.X.bc file]");
 
   auto ctx = std::make_unique<llvm::LLVMContext>();
   auto libdevice_module = module_from_bitcode_file(args[0], ctx.get());

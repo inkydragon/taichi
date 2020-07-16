@@ -40,8 +40,7 @@ class FlagAccess : public IRVisitor {
   }
 
   void visit(OffloadedStmt *stmt) {
-    if (stmt->body)
-      stmt->body->accept(this);
+    stmt->all_blocks_accept(this);
   }
 
   // Assuming pointers will be visited before global load/st
@@ -77,6 +76,8 @@ class WeakenAccess : public BasicStmtVisitor {
   WeakenAccess(IRNode *node) {
     allow_undefined_visitor = true;
     invoke_default_visitor = false;
+    current_struct_for = nullptr;
+    current_offload = nullptr;
     node->accept(this);
   }
 
@@ -86,6 +87,12 @@ class WeakenAccess : public BasicStmtVisitor {
     }
   }
 
+  void visit(StructForStmt *stmt) {
+    current_struct_for = stmt;
+    stmt->body->accept(this);
+    current_struct_for = nullptr;
+  }
+
   void visit(OffloadedStmt *stmt) {
     current_offload = stmt;
     if (stmt->body)
@@ -93,22 +100,38 @@ class WeakenAccess : public BasicStmtVisitor {
     current_offload = nullptr;
   }
 
+  static SNode *least_sparse_ancestor(SNode *a) {
+    while (a->type == SNodeType::place || a->type == SNodeType::dense) {
+      a = a->parent;
+    }
+    return a;
+  }
+
+  static bool share_sparsity(SNode *a, SNode *b) {
+    return least_sparse_ancestor(a) == least_sparse_ancestor(b);
+  }
+
   void visit(GlobalPtrStmt *stmt) {
     if (stmt->activate) {
-      if (current_offload &&
-          current_offload->task_type == OffloadedStmt::TaskType::struct_for) {
+      bool is_struct_for =
+          (current_offload &&
+           current_offload->task_type == OffloadedStmt::TaskType::struct_for) ||
+          current_struct_for;
+      if (is_struct_for) {
         bool same_as_loop_snode = true;
         for (auto snode : stmt->snodes.data) {
-          if (snode->type == SNodeType::place) {
-            snode = snode->parent;
+          SNode *loop_snode = nullptr;
+          if (current_struct_for) {
+            loop_snode = current_struct_for->snode;
+          } else {
+            loop_snode = current_offload->snode;
           }
-          if (snode != current_offload->snode) {
+          TI_ASSERT(loop_snode);
+          if (!share_sparsity(snode, loop_snode)) {
             same_as_loop_snode = false;
           }
-          if (stmt->indices.size() ==
-              current_offload->snode->num_active_indices)
-            for (int i = 0; i < current_offload->snode->num_active_indices;
-                 i++) {
+          if (stmt->indices.size() == loop_snode->num_active_indices)
+            for (int i = 0; i < loop_snode->num_active_indices; i++) {
               auto ind = stmt->indices[i];
               // TODO: vectorized cases?
               if (auto loop_var = ind->cast<LoopIndexStmt>()) {
@@ -128,11 +151,13 @@ class WeakenAccess : public BasicStmtVisitor {
 
  private:
   OffloadedStmt *current_offload;
+  StructForStmt *current_struct_for;
 };
 
 namespace irpass {
 
 void flag_access(IRNode *root) {
+  TI_AUTO_PROF;
   FlagAccess flag_access(root);
   WeakenAccess weaken_access(root);
 }
